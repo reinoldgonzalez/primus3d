@@ -1,5 +1,10 @@
 // Small DOM helpers: modal dialogs, sheet, toast.
 export const $ = <T extends HTMLElement = HTMLElement>(sel: string) => document.querySelector(sel) as T;
+// the tap that opened a dialog also produces a click a moment later (iOS/Android) — don't let it hit the dialog
+let modalOpenedAt = 0; let guarded = false;
+function guardModal(root: HTMLElement) { if (guarded) return; guarded = true; let downAt = 0;
+  root.addEventListener('pointerdown', () => { downAt = performance.now(); }, true);
+  root.addEventListener('click', e => { if (e.isTrusted && e.detail > 0 && downAt < modalOpenedAt && performance.now() - modalOpenedAt < 1000) { e.stopPropagation(); e.preventDefault(); } }, true); }
 export function h(tag: string, attrs: Record<string, any> = {}, ...kids: (Node | string | null | undefined | false)[]): HTMLElement {
   const el = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
@@ -14,13 +19,15 @@ export function toast(msg: string, ms = 2600) { const t = $('#toast'); t.textCon
 
 export function modal(title: string, body: HTMLElement | string, buttons: { label: string; primary?: boolean; danger?: boolean; value?: any }[] = [{ label: 'OK', primary: true, value: true }], opts: { wide?: boolean; onOpen?: (el: HTMLElement) => void } = {}): Promise<any> {
   return new Promise(res => {
-    const root = $('#modal'); root.innerHTML = '';
+    const root = $('#modal'); root.innerHTML = ''; guardModal(root);
     const close = (v: any) => { root.classList.remove('open'); root.innerHTML = ''; res(v); };
     const box = h('div', { class: 'mbox' + (opts.wide ? ' wide' : '') },
       h('div', { class: 'mhead' }, h('h2', {}, title), h('button', { class: 'x', 'aria-label': 'Close', onclick: () => close(null) }, '✕')),
       typeof body === 'string' ? h('div', { class: 'mbody', html: body }) : h('div', { class: 'mbody' }, body),
       buttons.length ? h('div', { class: 'mfoot' }, ...buttons.map(b => h('button', { class: 'btn' + (b.primary ? ' primary' : '') + (b.danger ? ' danger' : ''), onclick: () => close(b.value ?? b.label) }, b.label))) : null);
-    root.append(h('div', { class: 'mback', onclick: () => close(null) }), box); root.classList.add('open');
+    modalOpenedAt = performance.now();
+    root.append(h('div', { class: 'mback', onclick: () => close(null) }), box);
+root.classList.add('open');
     (root as any)._close = close; opts.onOpen?.(box);
   });
 }
