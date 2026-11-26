@@ -7,7 +7,7 @@ import { fmtLen, fmtArea, parseLen, setUnits, getUnits, fmtAngle, FT, IN } from 
 import { saveProject, listProjects, loadProject, deleteProject, lastProjectId, exportProjectJSON, importProjectJSON, requestPersist } from './storage';
 import { blueprintToImageBlob, scanFormat, loadScanObject, parseRoomPlanJSON, detectArchFromScene, applyArch, pdfPageScores, blobToCanvas } from './importers';
 import { analyze, deskew, lineDensity, looksLikePlan, Detection } from './autoconvert';
-import { geocode, leeParcel, usgsImage, toLocal, setbacks, edgeName, lotArea } from './site';
+import { geocode, leeParcel, leeParcelByStrap, leeStrapByAddress, aerialImage, leeBuildings, AERIALS, toLocal, setbacks, edgeName, lotArea } from './site';
 import { shareUrl, decodeProject, getBiz, setBiz } from './share';
 import { exportPNG, exportPDF, shareOrDownload, renderPlanCanvas, exportPermitPDF } from './export';
 import { exportDXF } from './dxf';
@@ -713,26 +713,49 @@ function renderPhotoEmpty() {
 
 // ---------- start from address ----------
 async function startFromAddress() {
-  const inp = h('input', { class: 'inp big', value: store.p.address || '', placeholder: '123 SE 1st Ter, Cape Coral, FL', autocomplete: 'street-address' }) as HTMLInputElement;
+  const inp = h('input', { class: 'inp big', value: store.p.address || '', placeholder: '123 SE 1st Ter, Cape Coral, FL', autocomplete: 'street-address', enterkeyhint: 'go', onkeydown: (e: KeyboardEvent) => { if (e.key === 'Enter') closeModal('go'); } }) as HTMLInputElement;
   const r = await modal('Start from address', h('div', {}, h('label', { class: 'lbl' }, 'Job address'), inp,
-    h('p', { class: 'muted' }, 'Free sources: lot lines from the Lee County Property Appraiser public parcel map (Lee County only), aerial from USGS (public domain, about 1 m detail), address search by OpenStreetMap. For a sharper aerial, import your own drone or Google Earth picture and line it up on two lot corners.')),
-    [{ label: 'Cancel', value: null }, { label: '📍 Find', primary: true, value: 'go' }], { onOpen: () => setTimeout(() => inp.focus(), 80) });
+    h('p', { class: 'muted' }, 'One tap gets: a sharp aerial at true scale, the lot lines, lot size and dimensions, and (Lee County) the existing house as editable 3D walls with setbacks. All free public sources.')),
+    [{ label: 'Cancel', value: null }, { label: '📍 Go', primary: true, value: 'go' }], { onOpen: () => setTimeout(() => inp.focus(), 80) });
   if (r !== 'go' || !inp.value.trim()) return; const q = inp.value.trim();
   const say = progress('Finding the lot'); try {
     say('Looking up the address…'); const g = await geocode(q); if (!g) { closeModal(); toast('Address not found. Try adding the city and FL.', 6000); return; }
     say('Getting lot lines…'); let lot: Pt[] | null = null; let parcel = ''; let o = { lat: g.lat, lon: g.lon };
-    try { const pr = await leeParcel(g.lat, g.lon); if (pr) { const ring = pr.ring.slice(0, -1); const c = { lat: ring.reduce((s, p) => s + p[1], 0) / ring.length, lon: ring.reduce((s, p) => s + p[0], 0) / ring.length }; o = c; lot = ring.map(([lon, lat]) => toLocal(lat, lon, c.lat, c.lon)); lot = simplifyRing(lot); parcel = pr.id; } } catch (e) { console.warn(e); }
-    say('Getting the aerial…'); let ext = 60; if (lot) { const xs = lot.map(p => p.x), ys = lot.map(p => p.y); ext = Math.max(50, 1.8 * Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys))); }
-    let blob: Blob | null = null; try { blob = await usgsImage(o.lat, o.lon, ext, 1024); } catch (e) { console.warn(e); }
+    try { const strap = await leeStrapByAddress(q).catch(() => null); const pr = (strap && await leeParcelByStrap(strap).catch(() => null)) || await leeParcel(g.lat, g.lon); if (pr) { const ring = pr.ring.slice(0, -1); const la = ring.map(p => p[1]), lo = ring.map(p => p[0]); const c = { lat: (Math.min(...la) + Math.max(...la)) / 2, lon: (Math.min(...lo) + Math.max(...lo)) / 2 }; o = c; lot = ring.map(([lon, lat]) => toLocal(lat, lon, c.lat, c.lon)); lot = simplifyRing(lot); parcel = pr.id; } } catch (e) { console.warn(e); }
+    say('Finding the existing house…'); let bld: { pts: Pt[]; info: any }[] = [];
+    try { bld = (await leeBuildings(parcel, g.lat, g.lon)).map(b => ({ pts: simplifyRing(b.ring.slice(0, -1).map(([lon, lat]) => toLocal(lat, lon, o.lat, o.lon))), info: b.info })).filter(b => b.pts.length >= 3); } catch (e) { console.warn(e); }
+    say('Getting the sharp aerial…'); let ext = 60; if (lot) { const xs = lot.map(p => p.x), ys = lot.map(p => p.y); ext = Math.max(45, 1.5 * Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys)), 2 * Math.max(...xs.map(Math.abs), ...ys.map(Math.abs)) + 10); }
+    let air: Awaited<ReturnType<typeof aerialImage>> | null = null; try { air = await aerialImage(o.lat, o.lon, ext, localStorage.getItem('p3d-aerial') || undefined); } catch (e) { console.warn(e); }
     closeModal();
+    const T = 8 * IN;
     store.mutate(p => {
-      p.address = q; if (/^Untitled/.test(p.name)) p.name = q.split(',')[0]; p.geo = { lat: o.lat, lon: o.lon, address: g.label, parcel, source: lot ? 'Lee County Property Appraiser parcels' : '' }; p.northDeg = 0;
+      p.address = q; if (/^Untitled/.test(p.name)) p.name = q.split(',')[0]; p.geo = { lat: o.lat, lon: o.lon, address: g.label, parcel, source: [lot ? 'Lot: Lee County Property Appraiser parcels' : '', bld.length ? 'House: Lee County GIS building footprints' : '', air ? 'Aerial: ' + air.src.label.replace(/ \(.*/, '') : ''].filter(Boolean).join(' · ') } as any; p.northDeg = 0;
       if (lot) { p.lot = lot.map(q2 => ({ x: snapIn(q2.x), y: snapIn(q2.y) })); (p as any).lotFront = guessFront(p.lot!); }
-      if (blob) { const id = uid(); store.assets.set(id, blob); p.background = { assetId: id, x: -ext / 2, y: -ext / 2, mpp: ext / 1024, rot: 0, opacity: 0.85, wpx: 1024, hpx: 1024, locked: true, visible: true, name: 'USGS aerial' }; }
+      if (air) { const id = uid(); store.assets.set(id, air.blob); p.background = { assetId: id, x: -ext / 2, y: -ext / 2, mpp: ext / air.px, rot: 0, opacity: 0.9, wpx: air.px, hpx: air.px, locked: true, visible: true, name: air.src.label }; (p as any).aerialExt = ext; }
+      for (const b of bld) { // existing building → editable walls on the footprint (outside face), plus a floor
+        let pts = b.pts.map(q2 => ({ x: snapIn(q2.x), y: snapIn(q2.y) })); if (polySignedArea(pts) < 0) pts = pts.reverse();
+        const cl = insetPoly(pts, T / 2); const stories = Math.max(1, +b.info?.MaxStories || 1);
+        const ids: string[] = []; for (let i = 0; i < cl.length; i++) { const a = cl[i], c = cl[(i + 1) % cl.length]; if (dist(a, c) < 0.2) continue; const w: Wall = { id: uid(), a: { ...a }, b: { ...c }, thickness: T, height: p.defaults.wallHeight * stories, color: '#f4f1ea' }; p.walls.push(w); ids.push(w.id); }
+        const desc = [b.info?.BldgDescription, b.info?.ActualYearBuilt ? 'built ' + b.info.ActualYearBuilt : '', b.info?.ActualArea ? b.info.ActualArea.toLocaleString() + ' sq ft total' : ''].filter(Boolean).join(', ');
+        p.rooms.push({ id: uid(), name: 'Existing house' + (desc ? ' (' + desc + ')' : ''), pts: insetPoly(pts, T), floor: 'tile', ceilingHeight: p.defaults.wallHeight, showCeiling: false });
+      }
     });
     fitDirty = true; setView('plan'); plan.fit();
-    toast(lot ? `Lot found${parcel ? ' (parcel ' + parcel + ')' : ''}: ${fmtArea(lotArea(store.p.lot!))}. Now draw the house or tap 🏊 for a pool.` : 'Aerial loaded (no parcel lines here — draw the lot with Floor/area, then “Use as lot lines”).', 7000);
+    const L = store.p.lot; const dims = L ? L.map((a, i) => fmtLen(dist(a, L[(i + 1) % L.length]), { short: true })).slice(0, 4).join(' × ') : '';
+    toast(lot ? `Lot ${fmtArea(lotArea(L!))}${dims ? ' (' + dims + ')' : ''}${bld.length ? ' · existing house added as walls' : ''}${air ? ' · aerial: ' + air.src.label : ''}. Setbacks show in orange.` : 'Aerial loaded (no parcel lines here — draw the lot with Floor/area, then “Use as lot lines”).', 9000);
   } catch (e: any) { closeModal(); toast('Could not load: ' + (e.message || e), 7000); }
+}
+function polySignedArea(P: Pt[]) { let s = 0; for (let i = 0; i < P.length; i++) { const a = P[i], b = P[(i + 1) % P.length]; s += a.x * b.y - b.x * a.y; } return s / 2; }
+/** Move every edge of a polygon (positive area in plan coords) inward by d and re-intersect the corners. */
+function insetPoly(P: Pt[], d: number): Pt[] {
+  const n = P.length; const s = polySignedArea(P) > 0 ? 1 : -1; const lines = P.map((a, i) => { const b = P[(i + 1) % n]; const L = dist(a, b) || 1; const nx = -(b.y - a.y) / L * s, ny = (b.x - a.x) / L * s; return { a: { x: a.x + nx * d, y: a.y + ny * d }, u: { x: (b.x - a.x) / L, y: (b.y - a.y) / L } }; });
+  return P.map((p, i) => { const A = lines[(i - 1 + n) % n], B = lines[i]; const den = A.u.x * B.u.y - A.u.y * B.u.x; if (Math.abs(den) < 1e-6) return B.a; const t = ((B.a.x - A.a.x) * B.u.y - (B.a.y - A.a.y) * B.u.x) / den; return { x: A.a.x + A.u.x * t, y: A.a.y + A.u.y * t }; });
+}
+async function changeAerial(id: string) {
+  const P = store.p; if (!P.geo) { toast('Start from an address first'); return; } localStorage.setItem('p3d-aerial', id);
+  const ext = (P as any).aerialExt || 60; const say = progress('Getting the aerial'); say('Downloading…');
+  try { const air = await aerialImage(P.geo.lat, P.geo.lon, ext, id); closeModal(); const aid = uid(); store.assets.set(aid, air.blob); store.mutate(p => { p.background = { assetId: aid, x: -ext / 2, y: -ext / 2, mpp: ext / air.px, rot: 0, opacity: p.background?.opacity ?? 0.9, wpx: air.px, hpx: air.px, locked: true, visible: true, name: air.src.label }; }); toast('Aerial: ' + air.src.label + (air.src.id !== id ? ' (that one has no picture here)' : '')); }
+  catch (e: any) { closeModal(); toast(e.message, 5000); }
 }
 function simplifyRing(L: Pt[]) { const out: Pt[] = []; for (let i = 0; i < L.length; i++) { const a = out[out.length - 1] || L[L.length - 1], b = L[i], c = L[(i + 1) % L.length]; const cr = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x); if (dist(a, b) < 0.05) continue; if (Math.abs(cr) / (dist(a, b) * dist(b, c) + 1e-9) < 0.01) continue; out.push(b); } return out.length >= 3 ? out : L; }
 function guessFront(L: Pt[]) { let best = 0, by = -Infinity; for (let i = 0; i < L.length; i++) { const a = L[i], b = L[(i + 1) % L.length]; const m = (a.y + b.y) / 2; if (m > by) { by = m; best = i; } } return best; }
@@ -745,7 +768,9 @@ async function lotPanel() {
   const sb = setbacks(P); const list = h('div', {}, h('p', {}, `Lot area ${fmtArea(lotArea(L))}${P.geo?.parcel ? ' · parcel ' + P.geo.parcel : ''}`),
     h('table', { class: 'tk' }, h('tr', {}, h('th', {}, 'Edge'), h('th', {}, 'Length')), ...L.map((a, i) => h('tr', {}, h('td', {}, `${i + 1}. ${edgeName(P, i)}`), h('td', {}, fmtLen(dist(a, L[(i + 1) % L.length]), { short: true }))))),
     h('h4', {}, 'Setbacks (closest distance to each lot line)'), sb.length ? h('table', { class: 'tk' }, ...sb.map(s => h('tr', {}, h('td', {}, `${s.what} → ${edgeName(P, s.edge)} (edge ${s.edge + 1})`), h('td', {}, fmtLen(s.d, { short: true }))))) : h('p', { class: 'muted' }, 'Draw the house or add a pool to see setbacks.'),
-    h('p', { class: 'muted' }, 'Lot lines from public parcel maps are approximate. Use the survey for permits.'));
+    P.geo ? h('div', {}, h('h4', {}, 'Aerial picture'), h('div', { class: 'row' }, ...AERIALS.map(a => h('button', { class: 'chip' + (P.background?.name === a.label ? ' on' : ''), onclick: () => { closeModal(); changeAerial(a.id); } }, a.label))),
+      h('p', { class: 'muted' }, 'FDOT = Florida DOT statewide photos (public record, about 3–6 in detail, a few years old). NAIP = USDA/USGS (public domain, newer but about 2 ft detail).')) : null,
+    h('p', { class: 'muted' }, (P.geo as any)?.source ? 'Sources: ' + (P.geo as any).source + '. ' : '', 'Lot lines from public parcel maps are approximate. Use the survey for permits.'));
   const r = await modal('Lot lines & setbacks', list, [{ label: 'Remove lot lines', danger: true, value: 'del' }, { label: '↻ Next edge is the front', value: 'front' }, { label: 'Done', primary: true, value: null }], { wide: true });
   if (r === 'del') store.mutate(p => { p.lot = null; }); if (r === 'front') { store.mutate(p => { (p as any).lotFront = (((p as any).lotFront || 0) + 1) % L.length; }); lotPanel(); }
 }

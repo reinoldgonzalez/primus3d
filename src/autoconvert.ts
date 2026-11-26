@@ -54,6 +54,31 @@ export function lineDensity(cv: HTMLCanvasElement): number {
   return on / (W * H);
 }
 
+/** Clean the sheet before reading it: invert blueprints (light lines on dark), flatten yellowed paper, shadows and uneven light. */
+export function prepare(src: HTMLCanvasElement): { cv: HTMLCanvasElement; notes: string[] } {
+  const W = src.width, H = src.height; const g = grayOf(src); const notes: string[] = []; const n = W * H;
+  let sum = 0; for (let i = 0; i < n; i++) sum += g[i];
+  if (sum / n < 110) { for (let i = 0; i < n; i++) g[i] = 255 - g[i]; notes.push('inverted'); }
+  const f = Math.max(1, Math.round(Math.max(W, H) / 300)); const w = Math.ceil(W / f), h = Math.ceil(H / f); const sm = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { let m = 0, c = 0; for (let yy = y * f; yy < Math.min(H, y * f + f); yy++) for (let xx = x * f; xx < Math.min(W, x * f + f); xx++) { m += g[yy * W + xx]; c++; } sm[y * w + x] = m / c; }
+  const r = Math.max(2, Math.round(Math.max(w, h) / 40)); const mx = new Float32Array(w * h), tmp = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { let m = 0; for (let q = Math.max(0, x - r); q <= Math.min(w - 1, x + r); q++) m = Math.max(m, sm[y * w + q]); tmp[y * w + x] = m; }
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { let m = 0; for (let q = Math.max(0, y - r); q <= Math.min(h - 1, y + r); q++) m = Math.max(m, tmp[q * w + x]); mx[y * w + x] = m; }
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { let m = 0, c = 0; for (let q = Math.max(0, x - r); q <= Math.min(w - 1, x + r); q++) { m += mx[y * w + q]; c++; } tmp[y * w + x] = m / c; }
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { let m = 0, c = 0; for (let q = Math.max(0, y - r); q <= Math.min(h - 1, y + r); q++) { m += tmp[q * w + x]; c++; } mx[y * w + x] = m / c; }
+  let bsum = 0, bmin = 255; for (const v of mx) { bsum += v; bmin = Math.min(bmin, v); } const bmean = bsum / mx.length;
+  const flatten = bmean < 238 || bmin < 200;
+  if (!flatten && !notes.length) return { cv: src, notes };
+  if (flatten) notes.push('flattened');
+  const out = document.createElement('canvas'); out.width = W; out.height = H; const oc = out.getContext('2d', { willReadFrequently: true })!; const od = oc.createImageData(W, H);
+  for (let y = 0; y < H; y++) { const sy = Math.min(h - 1, Math.max(0, (y + 0.5) / f - 0.5)); const y0 = Math.floor(sy), y1 = Math.min(h - 1, y0 + 1), fy = sy - y0;
+    for (let x = 0; x < W; x++) { const i = y * W + x; let v = g[i];
+      if (flatten) { const sx = Math.min(w - 1, Math.max(0, (x + 0.5) / f - 0.5)); const x0 = Math.floor(sx), x1 = Math.min(w - 1, x0 + 1), fx = sx - x0;
+        const b = (mx[y0 * w + x0] * (1 - fx) + mx[y0 * w + x1] * fx) * (1 - fy) + (mx[y1 * w + x0] * (1 - fx) + mx[y1 * w + x1] * fx) * fy; v = Math.min(255, (v * 255) / Math.max(30, b)); }
+      od.data[i * 4] = od.data[i * 4 + 1] = od.data[i * 4 + 2] = v; od.data[i * 4 + 3] = 255; } }
+  oc.putImageData(od, 0, 0); return { cv: out, notes };
+}
+
 // ---------------- morphology ----------------
 function integral(m: Uint8Array, W: number, H: number) { const I = new Uint32Array((W + 1) * (H + 1)); for (let y = 0; y < H; y++) { let r = 0; for (let x = 0; x < W; x++) { r += m[y * W + x]; I[(y + 1) * (W + 1) + x + 1] = I[y * (W + 1) + x + 1] + r; } } return I; }
 const box = (I: Uint32Array, W: number, x0: number, y0: number, x1: number, y1: number) => I[y1 * (W + 1) + x1] - I[y0 * (W + 1) + x1] - I[y1 * (W + 1) + x0] + I[y0 * (W + 1) + x0];
@@ -64,6 +89,7 @@ function open(m: Uint8Array, W: number, H: number, k: number) {
   for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { if (!m[y * W + x]) continue; const x0 = Math.max(0, x - k + 1), y0 = Math.max(0, y - k + 1); if (box(J, W, x0, y0, x + 1, y + 1) > 0) O[y * W + x] = 1; }
   return O;
 }
+function erode(m: Uint8Array, W: number, H: number, r: number) { const inv = new Uint8Array(W * H); for (let i = 0; i < inv.length; i++) inv[i] = m[i] ? 0 : 1; const d = dilate(inv, W, H, r); for (let i = 0; i < d.length; i++) d[i] = d[i] ? 0 : 1; return d; }
 function dilate(m: Uint8Array, W: number, H: number, r: number) { const I = integral(m, W, H); const O = new Uint8Array(W * H); for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { const x0 = Math.max(0, x - r), y0 = Math.max(0, y - r), x1 = Math.min(W, x + r + 1), y1 = Math.min(H, y + r + 1); if (box(I, W, x0, y0, x1, y1) > 0) O[y * W + x] = 1; } return O; }
 
 /** Typical thin-line width: the most common short dark run length. */
@@ -125,7 +151,7 @@ export async function ocr(cv: HTMLCanvasElement, onProgress?: (s: string) => voi
 /** "12'-6"", "12' 6", "12'6 1/2"", "40'", "3.5m", "3500mm" → meters */
 export function parseDim(s: string): number | null {
   const t = s.replace(/[’′`´]/g, "'").replace(/[”″]|''/g, '"').replace(/\s+/g, ' ').trim();
-  let m = t.match(/^(\d{1,3})\s*'\s*-?\s*(\d{1,2})?(?:\s+(\d)\/(\d{1,2}))?\s*"?$/);
+  let m = t.match(/^(\d{1,3})\s*'\s*-?\s*(\d{1,2})?(?:\s+(\d{1,2})\/(\d{1,2}))?\s*"?$/);
   if (m) { const ft = +m[1], inch = m[2] ? +m[2] : 0, fr = m[3] ? +m[3] / +m[4] : 0; if (inch >= 12) return null; return ft * FT + (inch + fr) * IN; }
   m = t.match(/^(\d{1,3})\s*-\s*(\d{1,2})\s*"$/); if (m && +m[2] < 12) return +m[1] * FT + +m[2] * IN; // apostrophe lost by OCR: 14-0"
   m = t.match(/^(\d{1,3}(?:\.\d+)?)\s*m$/i); if (m) return +m[1];
@@ -159,7 +185,7 @@ function cleanForOcr(cv: HTMLCanvasElement, D: Uint8Array, segs: Seg[], W: numbe
 }
 
 // ---------------- main ----------------
-export async function analyze(img: CanvasImageSource & { width: number; height: number }, opts: { onProgress?: (s: string) => void; useOcr?: boolean } = {}): Promise<Detection> {
+export async function analyze(img: CanvasImageSource & { width: number; height: number }, opts: { onProgress?: (s: string) => void; useOcr?: boolean; forceMpp?: number; forceNote?: string; words?: OcrWord[] } = {}): Promise<Detection> {
   const t0 = performance.now(); const say = opts.onProgress || (() => {});
   const { cv, k } = canvasFrom(img, 2200); const W = cv.width, H = cv.height; const maxD = Math.max(W, H);
   say('Finding lines…'); await new Promise(r => setTimeout(r, 0));
@@ -169,12 +195,21 @@ export async function analyze(img: CanvasImageSource & { width: number; height: 
   const O = open(D, W, H, lw + 2);
   const segs: Seg[] = [];
   for (const o of ['h', 'v'] as const) for (const s of extract(O, W, H, o, Lmin, 1)) if (s.t >= lw + 2 && s.b - s.a >= Math.max(Lmin, 1.5 * s.t)) segs.push({ o, ...s, src: 'thick' });
+  // 1b) hatched / patterned walls (two outlines with hatching between): close small gaps, keep bands whose two edges are continuous lines
+  { const Cl = erode(dilate(D, W, H, 2), W, H, 2); const O2 = open(Cl, W, H, lw + 3);
+    const edgeCov = (o: 'h' | 'v', c: number, a: number, b: number) => { let n = 0, on = 0; for (let q = Math.ceil(a); q <= b; q += 1) { n++; let dk = 0; for (let e = -1; e <= 1; e++) { const cc = Math.round(c) + e; dk |= o === 'h' ? (cc >= 0 && cc < H ? D[cc * W + q] : 0) : (cc >= 0 && cc < W ? D[q * W + cc] : 0); } on += dk; } return n ? on / n : 0; };
+    for (const o of ['h', 'v'] as const) for (const s of extract(O2, W, H, o, Lmin, 1)) {
+      if (s.t < lw + 3 || s.t > maxD * 0.03 || s.b - s.a < Math.max(2 * Lmin, 2 * s.t)) continue;
+      if (segs.some(q => q.o === o && Math.abs(q.c - s.c) < (q.t + s.t) / 2 && Math.min(q.b, s.b) - Math.max(q.a, s.a) > 0.5 * (s.b - s.a))) continue;
+      const e1 = edgeCov(o, s.c - s.t / 2 + 1, s.a, s.b), e2 = edgeCov(o, s.c + s.t / 2 - 1, s.a, s.b);
+      if (e1 > 0.8 && e2 > 0.8) segs.push({ o, ...s, src: 'thick' });
+    } }
   // 2) thin lines (double-line walls, glazing, dimension lines)
   const Od = dilate(O, W, H, 1); const Tm = new Uint8Array(W * H); for (let i = 0; i < Tm.length; i++) Tm[i] = D[i] && !Od[i] ? 1 : 0;
   const thin: Seg[] = []; for (const o of ['h', 'v'] as const) for (const s of extract(Tm, W, H, o, Lmin, 2)) if (s.t <= lw * 2 + 1) thin.push({ o, ...s, src: 'thin' });
   // 3) OCR → scale
   let words: OcrWord[] = []; let ocrOk = false;
-  if (opts.useOcr !== false) { try { words = await ocr(cleanForOcr(cv, D, segs, W, H, Lmin), say); ocrOk = true; } catch (e) { console.warn('OCR unavailable', e); } }
+  if (opts.words) { words = opts.words; ocrOk = true; } else if (opts.useOcr !== false) { try { words = await ocr(cleanForOcr(cv, D, segs, W, H, Lmin), say); ocrOk = true; } catch (e) { console.warn('OCR unavailable', e); } }
   const dims = dimsFromWords(words);
   const at = (x: number, y: number) => (x >= 0 && y >= 0 && x < W && y < H ? D[(y | 0) * W + (x | 0)] : 0);
   // match each horizontal dimension text to the dimension line under/over it, split at tick marks
@@ -198,6 +233,7 @@ export async function analyze(img: CanvasImageSource & { width: number; height: 
     const plausible = !thickMax || (thickMax * r > 2.5 * IN && thickMax * r < 20 * IN);
     if ((bestSet.length >= 2 || ratios.length === 1) && plausible) { mpp = r; scaleFrom = 'ocr'; scaleNote = `from ${bestSet.length} dimension${bestSet.length > 1 ? 's' : ''} (${bestSet.map(x => x.d.text).slice(0, 3).join(', ')})`; }
   }
+  if (opts.forceMpp) { mpp = opts.forceMpp; scaleFrom = 'ocr'; scaleNote = opts.forceNote || 'set'; }
   if (!mpp) { const tk = segs.map(s => s.t).sort((a, b) => b - a); const ref = tk.length ? tk[Math.min(2, tk.length - 1)] : 0; mpp = ref ? (8 * IN) / ref : (50 * FT) / maxD; scaleNote = ref ? 'guessed from wall thickness — please confirm' : 'unknown — please set it'; }
   const px = (m: number) => m / mpp;
   // 4) pair thin parallel lines → double-line walls
@@ -261,6 +297,20 @@ export async function analyze(img: CanvasImageSource & { width: number; height: 
   for (const L of lines) for (const end of ['a', 'b'] as const) { // the other way round (perpendicular wall end meets this line)
     for (const P of lines) { if (P.o === L.o) continue; for (const pe of ['a', 'b'] as const) if (Math.abs(P[pe] - L.c) < 0.5 && Math.abs(P.c - L[end]) <= L.t / 2 + P.t / 2 + 4 + lw) L[end] = P.c; }
   }
+  // 6b) clutter: strokes inside text labels, and small pieces that touch no wall network (furniture, symbols, stairs, title text)
+  { const tb = words.filter(w => w.conf > 45 && w.text.length >= 2 && /[A-Za-z0-9]/.test(w.text)).map(w => { const hh = w.y1 - w.y0; return { x0: w.x0 - hh * 0.25, y0: w.y0 - hh * 0.25, x1: w.x1 + hh * 0.25, y1: w.y1 + hh * 0.25, hh }; });
+    const inText = (L: Line) => { const len = L.b - L.a; if (len <= 0) return true; let cov = 0;
+      for (const b of tb) { if (len > 4 * b.hh) continue; const [p0, p1, c0, c1] = L.o === 'h' ? [b.x0, b.x1, b.y0, b.y1] : [b.y0, b.y1, b.x0, b.x1]; if (L.c < c0 || L.c > c1) continue; cov += Math.max(0, Math.min(L.b, p1) - Math.max(L.a, p0)); }
+      return cov >= 0.6 * len; };
+    for (let i = lines.length - 1; i >= 0; i--) if (inText(lines[i])) lines.splice(i, 1);
+    const par = lines.map((_, i) => i); const find = (i: number): number => (par[i] === i ? i : (par[i] = find(par[i])));
+    for (let i = 0; i < lines.length; i++) for (let j = i + 1; j < lines.length; j++) { const A = lines[i], B = lines[j]; const tol = Math.max(A.t, B.t) / 2 + 3 + lw;
+      const touch = A.o !== B.o ? (A.c >= B.a - tol && A.c <= B.b + tol && B.c >= A.a - tol && B.c <= A.b + tol) : (Math.abs(A.c - B.c) <= tol && Math.min(A.b, B.b) - Math.max(A.a, B.a) >= -tol);
+      if (touch) par[find(i)] = find(j); }
+    const tot = new Map<number, number>(); lines.forEach((L, i) => tot.set(find(i), (tot.get(find(i)) || 0) + (L.b - L.a)));
+    const big = Math.max(0, ...tot.values());
+    for (let i = lines.length - 1; i >= 0; i--) if ((tot.get(find(i)) || 0) < 0.12 * big) lines.splice(i, 1);
+  }
   // 7) classify door gaps (swing arc beside the gap?)
   const dens = (x0: number, y0: number, x1: number, y1: number) => { let n = 0, on = 0; for (let y = Math.max(0, y0 | 0); y < Math.min(H, y1); y += 1) for (let x = Math.max(0, x0 | 0); x < Math.min(W, x1); x += 1) { n++; on += D[y * W + x]; } return n ? on / n : 0; };
   const dOps: DOpening[] = []; const dWalls: DWall[] = [];
@@ -308,16 +358,41 @@ export async function analyze(img: CanvasImageSource & { width: number; height: 
     for (const ws2 of lineMap.values()) {
       const inside = ws2.filter(w => /[A-Za-z]|^\d$/.test(w.text) && w.conf > 40 && pip({ x: (w.x0 + w.x1) / 2 / k, y: (w.y0 + w.y1) / 2 / k }, r.pts));
       if (!inside.some(w => /[A-Za-z]{2,}/.test(w.text))) continue; const txt = inside.map(w => w.text).join(' ').replace(/[^\w .&/'-]/g, '').trim(); if (!txt || parseDim(txt)) continue;
-      const hh = Math.max(...inside.map(w => w.y1 - w.y0)), y = Math.min(...inside.map(w => w.y0));
-      if (hh > bh * 1.15 || (hh > bh * 0.85 && y < by)) { best = txt; bh = hh; by = y; }
+      const hh = Math.max(...inside.map(w => w.y1 - w.y0)) * (ROOMWORD.test(txt) ? 4 : inside.some(w => w.conf > 75 && /[A-Za-z]{3,}/.test(w.text)) ? 1 : 0.2), y = Math.min(...inside.map(w => w.y0));
+      if (hh > bh * 1.15 || (hh > bh * 0.85 && y < by)) { best = txt.replace(/\s*\d.*$/, '').trim() || txt; bh = hh; by = y; }
     }
     r.name = best.toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
+  }
+  // scale from room-size labels ("BEDROOM 12'0" X 14'0"") when no dimension line gave it
+  if (scaleFrom === 'guess' && !opts.forceMpp) {
+    const cand: { r: number; txt: string }[] = [];
+    for (const ws2 of lineMap.values()) {
+      const txt = ws2.sort((a, b) => a.x0 - b.x0).map(w => w.text).join(' '); const m = roomSize(txt); if (!m) continue;
+      const cx = ws2.reduce((s2, w) => s2 + (w.x0 + w.x1) / 2, 0) / ws2.length / k, cy = ws2.reduce((s2, w) => s2 + (w.y0 + w.y1) / 2, 0) / ws2.length / k;
+      const room = dRooms.find(r => pip({ x: cx, y: cy }, r.pts)); if (!room) continue;
+      const xs = room.pts.map(p => p.x * k), ys = room.pts.map(p => p.y * k); const bw = Math.max(...xs) - Math.min(...xs), bh2 = Math.max(...ys) - Math.min(...ys);
+      const o1 = [m[0] / bw, m[1] / bh2], o2 = [m[1] / bw, m[0] / bh2]; const d1 = Math.abs(o1[0] / o1[1] - 1), d2 = Math.abs(o2[0] / o2[1] - 1); const [o, dd] = d1 < d2 ? [o1, d1] : [o2, d2];
+      if (dd < 0.12) cand.push({ r: (o[0] + o[1]) / 2, txt: txt.replace(/^.*?(\d)/, '$1') });
+    }
+    let bestSet: typeof cand = []; for (const a of cand) { const set = cand.filter(b => Math.abs(b.r / a.r - 1) < 0.07); if (set.length > bestSet.length) bestSet = set; }
+    if (bestSet.length >= 2 || (cand.length === 1)) { const r = bestSet.reduce((s2, x) => s2 + x.r, 0) / bestSet.length; const note = `from ${bestSet.length} room size${bestSet.length > 1 ? 's' : ''} (${bestSet.slice(0, 2).map(x => x.txt).join(', ')}) — please check one wall`;
+      if (Math.abs(r / mpp - 1) > 0.08) return analyze(img, { ...opts, forceMpp: r, forceNote: note, words });
+      mpp = r; scaleFrom = 'ocr'; scaleNote = note; }
   }
   const scale = (p: { x: number; y: number }) => ({ x: p.x / k, y: p.y / k });
   const walls = dWalls.map(w => ({ a: scale(w.a), b: scale(w.b), t: w.t / k, ext: w.ext }));
   const longestDim = dims.reduce<DDim | null>((b, d) => (!b || d.m > b.m ? d : b), null);
   const sc = (d: DDim) => ({ ...d, x0: d.x0 / k, y0: d.y0 / k, x1: d.x1 / k, y1: d.y1 / k });
   return { w: W / k, h: H / k, walls, openings: dOps, rooms: dRooms, mpp: mpp * k, scaleFrom, scaleNote, dims: dims.map(sc), longestDim: longestDim ? sc(longestDim) : null, ocrOk, words: words.map(w => ({ ...w, x0: w.x0 / k, y0: w.y0 / k, x1: w.x1 / k, y1: w.y1 / k })), ms: performance.now() - t0 };
+}
+const ROOMWORD = /\b(bed|bdrm|br|bath|ba|wc|toilet|kitchen|kit|living|liv|dining|din|family|great|garage|gar|master|mstr|closet|clo|wic|laundry|util|utility|pantry|porch|lanai|patio|deck|den|office|study|foyer|entry|lobby|hall|nook|bonus|media|game|loft|mud|storage|stor|mech|lr|dr|k|pool|cabana|guest|suite|room)\b/i;
+/** "12'0" X 14'0"", "12'-6" x 10'", "12 x 14" (feet) → [m, m] */
+function roomSize(t: string): [number, number] | null {
+  const s = t.replace(/[’′`´]/g, "'").replace(/[”″]|''/g, '"').replace(/[×*]/g, 'x');
+  const D = String.raw`(\d{1,3}\s*'\s*-?\s*\d{0,2}(?:\s+\d{1,2}\/\d{1,2})?\s*"?|\d{1,3}(?:\.\d+)?\s*m?)`;
+  const m = s.match(new RegExp(D + String.raw`\s*[xX]\s*` + D)); if (!m) return null;
+  const v = (q: string) => { q = q.trim(); const d = parseDim(q); if (d) return d; const n = parseFloat(q); if (!n) return null; return /m$/.test(q) ? n : n * FT; };
+  const a = v(m[1]), b = v(m[2]); if (!a || !b || a < 1.2 || b < 1.2 || a > 25 || b > 25) return null; return [a, b];
 }
 function pip(p: { x: number; y: number }, pts: { x: number; y: number }[]) { let ins = false; for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) { const a = pts[i], b = pts[j]; if ((a.y > p.y) !== (b.y > p.y) && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x) ins = !ins; } return ins; }
 /** Outer boundary of a labelled grid region as an orthogonal polygon (grid-corner coordinates). */

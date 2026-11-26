@@ -23,11 +23,58 @@ export async function leeParcel(lat: number, lon: number): Promise<{ ring: [numb
   let best: any = null, bd = Infinity; for (const f of fs) { const ring = f.geometry?.rings?.[0]; if (!ring) continue; const cx = ring.reduce((s: number, p: number[]) => s + p[0], 0) / ring.length, cy = ring.reduce((s: number, p: number[]) => s + p[1], 0) / ring.length; const d = (cx - lon) ** 2 + (cy - lat) ** 2; if (d < bd) { bd = d; best = f; } }
   return best ? { ring: best.geometry.rings[0], id: best.attributes?.Name || '', area: best.attributes?.StatedArea || '' } : null;
 }
-/** USGS National Map orthoimagery (public domain). Square image of `size` m around the point. */
-export async function usgsImage(lat: number, lon: number, size: number, px = 1024): Promise<Blob> {
+/** Free aerial sources that allow business use (checked Nov 2026):
+ *  - FDOT statewide orthophotos (Florida public record, 3–6 in pixels; Lee County flown 2020), served by FL DEP.
+ *  - USGS NAIP (public domain, 0.6 m, newer), USGS National Map imagery (public domain, ~1 m) as last resort.
+ *  NOT used: Lee County / LeePA 3-inch aerials ("personal, non-business use" only), Esri/Google/Mapbox (need an API key and forbid storing images). */
+export interface AerialSource { id: string; label: string; url: string; kind: 'image' | 'map'; mpp: number }
+export const AERIALS: AerialSource[] = [
+  { id: 'fdot2021', label: 'FDOT 2021 (sharp)', url: 'https://ca.dep.state.fl.us/image/rest/services/FDOT_Yearly_Aerials/Aerial_Imagery_2021/ImageServer', kind: 'image', mpp: 0.08 },
+  { id: 'fdot2020', label: 'FDOT 2020 (sharp)', url: 'https://ca.dep.state.fl.us/image/rest/services/FDOT_Yearly_Aerials/Aerial_Imagery_2020/ImageServer', kind: 'image', mpp: 0.08 },
+  { id: 'fdot2019', label: 'FDOT 2019 (sharp)', url: 'https://ca.dep.state.fl.us/image/rest/services/FDOT_Yearly_Aerials/Aerial_Imagery_2019/ImageServer', kind: 'image', mpp: 0.08 },
+  { id: 'fdot2018', label: 'FDOT 2018 (sharp)', url: 'https://ca.dep.state.fl.us/image/rest/services/FDOT_Yearly_Aerials/Aerial_Imagery_2018/ImageServer', kind: 'image', mpp: 0.08 },
+  { id: 'naip', label: 'USGS NAIP (newer, 2 ft)', url: 'https://imagery.nationalmap.gov/arcgis/rest/services/USGSNAIPImagery/ImageServer', kind: 'image', mpp: 0.3 },
+  { id: 'usgs', label: 'USGS basic (3 ft)', url: 'https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer', kind: 'map', mpp: 0.5 },
+];
+async function blank(b: Blob) { // a source with no coverage returns a flat image
+  const bm = await createImageBitmap(b); const c = document.createElement('canvas'); c.width = 64; c.height = 64; const x = c.getContext('2d', { willReadFrequently: true })!; x.drawImage(bm, 0, 0, 64, 64);
+  const d = x.getImageData(0, 0, 64, 64).data; let s = 0, s2 = 0; const n = d.length / 4; for (let i = 0; i < d.length; i += 4) { const v = d[i] + d[i + 1] + d[i + 2]; s += v; s2 += v * v; } const sd = Math.sqrt(s2 / n - (s / n) ** 2); return sd < 6; }
+/** Square aerial of `size` m around the point at the source's full detail (≤ 4000 px). Tries sources in order until one has coverage. */
+export async function aerialImage(lat: number, lon: number, size: number, prefer?: string): Promise<{ blob: Blob; px: number; src: AerialSource }> {
   const mx = lon * D2R * R, my = Math.log(Math.tan(Math.PI / 4 + lat * D2R / 2)) * R; const half = size / 2 / Math.cos(lat * D2R);
-  const u = `https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/export?bbox=${mx - half},${my - half},${mx + half},${my + half}&bboxSR=3857&imageSR=3857&size=${px},${px}&format=jpg&f=image`;
-  const r = await fetch(u); if (!r.ok) throw new Error('Aerial download failed'); return r.blob();
+  const order = prefer ? [...AERIALS.filter(a => a.id === prefer), ...AERIALS.filter(a => a.id !== prefer)] : AERIALS;
+  for (const a of order) {
+    const px = Math.min(4000, Math.max(800, Math.round(size / a.mpp)));
+    const u = `${a.url}/${a.kind === 'image' ? 'exportImage' : 'export'}?bbox=${mx - half},${my - half},${mx + half},${my + half}&bboxSR=3857&imageSR=3857&size=${px},${px}&format=jpg&f=image`;
+    try { const r = await fetch(u); if (!r.ok) continue; const b = await r.blob(); if (!b.type.startsWith('image') || await blank(b)) continue; return { blob: b, px, src: a }; } catch (e) { console.warn(a.id, e); }
+  }
+  throw new Error('No aerial available here');
+}
+/** Old name kept for callers. */
+export async function usgsImage(lat: number, lon: number, size: number, px = 1024): Promise<Blob> { void px; return (await aerialImage(lat, lon, size, 'usgs')).blob; }
+
+/** "13 Northwest 36th Avenue" → "13 NW 36TH AVE" (Lee County address style). */
+export function leeStreet(q: string): string {
+  const A: Record<string, string> = { NORTHWEST: 'NW', NORTHEAST: 'NE', SOUTHWEST: 'SW', SOUTHEAST: 'SE', NORTH: 'N', SOUTH: 'S', EAST: 'E', WEST: 'W', AVENUE: 'AVE', STREET: 'ST', TERRACE: 'TER', PARKWAY: 'PKWY', BOULEVARD: 'BLVD', COURT: 'CT', PLACE: 'PL', LANE: 'LN', ROAD: 'RD', DRIVE: 'DR', CIRCLE: 'CIR', WAY: 'WAY', LOOP: 'LOOP', TRAIL: 'TRL', HIGHWAY: 'HWY', COVE: 'CV', POINT: 'PT', ISLE: 'ISLE' };
+  return q.split(',')[0].toUpperCase().replace(/[.#]/g, ' ').replace(/\b(\d+)(ST|ND|RD|TH)\b/g, '$1$2').split(/\s+/).filter(Boolean).map(w => A[w] || w).join(' ').replace(/\b(\d+)\b(?= (AVE|ST|TER|PL|CT|LN|RD|DR)\b)/g, (m, n) => n + (/1[123]$/.test(n) ? 'TH' : n.endsWith('1') ? 'ST' : n.endsWith('2') ? 'ND' : n.endsWith('3') ? 'RD' : 'TH'));
+}
+/** Exact parcel number from the typed address (Lee County footprints carry the site address). */
+export async function leeStrapByAddress(q: string): Promise<string | null> {
+  const st = leeStreet(q); if (!/^\d+ /.test(st)) return null;
+  const u = 'https://services2.arcgis.com/LvWGAAhHwbCJ2GMP/arcgis/rest/services/Building_Footprints/FeatureServer/0/query?f=json&returnGeometry=false&outFields=STRAP,StreetAddress&where=' + encodeURIComponent(`StreetAddress='${st.replace(/'/g, '')}'`);
+  const r = await fetch(u); if (!r.ok) return null; const j = await r.json(); return j.features?.[0]?.attributes?.STRAP || null;
+}
+export async function leeParcelByStrap(strap: string): Promise<{ ring: [number, number][]; id: string; area: string } | null> {
+  const u = 'https://gissvr.leepa.org/gissvr/rest/services/ParcelsWFS/MapServer/0/query?f=json&returnGeometry=true&outSR=4326&outFields=Name,StatedArea&where=' + encodeURIComponent(`Name='${strap.replace(/'/g, '')}'`);
+  const r = await fetch(u); if (!r.ok) return null; const j = await r.json(); const f = j.features?.[0]; return f?.geometry?.rings?.[0] ? { ring: f.geometry.rings[0], id: f.attributes?.Name || strap, area: f.attributes?.StatedArea || '' } : null;
+}
+/** Lee County GIS building footprints (from the Property Appraiser; public information resource). Rings in lat/lon. */
+export async function leeBuildings(strap: string, lat: number, lon: number): Promise<{ ring: [number, number][]; info: any }[]> {
+  const base = 'https://services2.arcgis.com/LvWGAAhHwbCJ2GMP/arcgis/rest/services/Building_Footprints/FeatureServer/0/query?f=json&returnGeometry=true&outSR=4326&outFields=STRAP,BldgDescription,MaxStories,ActualArea,ActualYearBuilt,StreetAddress,BldgUseType';
+  let u = base + (strap ? '&where=' + encodeURIComponent(`STRAP='${strap.replace(/'/g, '')}'`) : `&where=1%3D1&inSR=4326&geometryType=esriGeometryPoint&spatialRel=esriSpatialRelIntersects&geometry=${lon},${lat}`);
+  let r = await fetch(u); let j = r.ok ? await r.json() : {}; let fs: any[] = j.features || [];
+  if (!fs.length && strap) { u = base + `&where=1%3D1&inSR=4326&geometryType=esriGeometryPoint&spatialRel=esriSpatialRelIntersects&geometry=${lon},${lat}`; r = await fetch(u); j = r.ok ? await r.json() : {}; fs = j.features || []; }
+  return fs.filter(f => f.geometry?.rings?.[0]).map(f => ({ ring: f.geometry.rings[0], info: f.attributes }));
 }
 
 // ---------- setbacks ----------
