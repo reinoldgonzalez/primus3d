@@ -1,4 +1,5 @@
 import { roomOutline } from './model';
+import { drawSite } from './site';
 import { store, Pt, Wall, Opening, Obj, Project, uid, dist, wallLen, wallDir, pointOnWall, projectOnSeg, polyArea, polyCentroid, pointInPoly, objCorners, wallOpenings, FLOORS, OBJECT_PRESETS, Selection, OpeningKind } from './model';
 import { fmtLen, fmtArea, getUnits, FT, IN } from './units';
 import { OPENING_BY_KEY } from './catalog';
@@ -26,6 +27,10 @@ export class PlanView {
   tool: Tool = 'select';
   objectPreset = 'base';
   snap = true; showDims = true;
+  /** auto-convert review: colour walls/doors/windows */
+  review = false;
+  /** Apple Pencil palm rejection: while the pen is down (and shortly after), ignore touches */
+  private penUntil = 0;
   wallStart: Pt | null = null; cursor: Pt | null = null; chainCount = 0;
   roomPts: Pt[] = [];
   measA: Pt | null = null;
@@ -128,6 +133,8 @@ export class PlanView {
   // ---------- pointer ----------
   private sp(e: PointerEvent) { const r = this.canvas.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; }
   onDown(e: PointerEvent) {
+    if (e.pointerType === 'pen') { this.penUntil = Infinity; for (const id of [...this.pointers.keys()]) this.pointers.delete(id); this.drag = null; this.pinch = null; }
+    else if (e.pointerType === 'touch' && performance.now() < this.penUntil) return;
     this.canvas.setPointerCapture(e.pointerId);
     const s = this.sp(e); this.pointers.set(e.pointerId, s);
     if (this.pointers.size === 2) {
@@ -164,6 +171,7 @@ export class PlanView {
     return p;
   }
   onMove(e: PointerEvent) {
+    if (e.pointerType === 'touch' && performance.now() < this.penUntil) return;
     const s = this.sp(e);
     if (this.pointers.has(e.pointerId)) this.pointers.set(e.pointerId, s);
     if (this.pinch && this.pointers.size >= 2) {
@@ -236,6 +244,8 @@ export class PlanView {
     d.last = p; store.emit('live');
   }
   onUp(e: PointerEvent, cancel = false) {
+    if (e.pointerType === 'pen') this.penUntil = performance.now() + 600;
+    else if (e.pointerType === 'touch' && !this.pointers.has(e.pointerId)) return;
     this.pointers.delete(e.pointerId);
     if (this.pinch) { if (this.pointers.size < 2) { this.pinch = null; this.drag = null; } return; }
     const d = this.drag; this.drag = null; if (!d) return;
@@ -271,7 +281,7 @@ export class PlanView {
         break;
       }
       case 'calibrate': {
-        if (!this.calA) { this.calA = raw; this.calB = null; }
+        if (!this.calA) { this.calA = raw; this.calB = null; this.hooks.onDraftChange(); }
         else {
           this.calB = raw; const a = this.calA, b = raw; const measured = dist(a, b); this.redraw();
           this.hooks.askDistance(measured).then(real => {
@@ -342,7 +352,7 @@ export class PlanView {
     const c = this.ctx; const dpr = this.canvas.width / (this.w || 1);
     c.setTransform(dpr, 0, 0, dpr, 0, 0); c.clearRect(0, 0, this.w, this.h);
     c.fillStyle = '#fbfaf7'; c.fillRect(0, 0, this.w, this.h);
-    drawPlan(c, store.p, this.v, this.w, this.h, { grid: true, dims: this.showDims, sel: store.sel, underlay: this.scanUnderlay, redraw: () => this.redraw(), handles: true });
+    drawPlan(c, store.p, this.v, this.w, this.h, { review: this.review, grid: true, dims: this.showDims, sel: store.sel, underlay: this.scanUnderlay, redraw: () => this.redraw(), handles: true });
     // drafts
     c.save(); this.applyXf(c);
     const px = 1 / this.v.scale;
@@ -385,7 +395,7 @@ function drawScaleBar(c: CanvasRenderingContext2D, v: ViewXf, w: number, h: numb
   c.font = '600 11px system-ui, sans-serif'; c.fillStyle = '#333'; c.fillText(fmtLen(L, { short: true }), x + px + 6, y + 2); c.restore();
 }
 
-export interface DrawOpts { grid: boolean; dims: boolean; sel: Selection | null; underlay?: Underlay | null; redraw?: () => void; handles?: boolean; print?: boolean; bg?: boolean }
+export interface DrawOpts { review?: boolean; grid: boolean; dims: boolean; sel: Selection | null; underlay?: Underlay | null; redraw?: () => void; handles?: boolean; print?: boolean; bg?: boolean }
 
 /** Shared plan renderer (screen + export). */
 export function drawPlan(c: CanvasRenderingContext2D, P: Project, v: ViewXf, W: number, H: number, o: DrawOpts) {
@@ -425,6 +435,7 @@ export function drawPlan(c: CanvasRenderingContext2D, P: Project, v: ViewXf, W: 
       for (let k = 0; k < r.pts.length; k++) { const q = r.pts[k], q2 = r.pts[(k + 1) % r.pts.length]; c.fillStyle = '#1971c2'; c.beginPath(); c.arc((q.x + q2.x) / 2, (q.y + q2.y) / 2, 4 * px, 0, 7); c.fill(); }
       for (const q of r.pts) { c.fillStyle = '#fff'; c.strokeStyle = '#1971c2'; c.lineWidth = 2 * px; c.beginPath(); c.arc(q.x, q.y, 7 * px, 0, 7); c.fill(); c.stroke(); } } }
   }
+  drawSite(c, P, px, o.dims, !!o.print);
   // walls
   const selWall = o.sel && (o.sel.kind === 'wall' || o.sel.kind === 'joint') ? o.sel.id : null;
   for (const w of P.walls) {
@@ -437,7 +448,7 @@ export function drawPlan(c: CanvasRenderingContext2D, P: Project, v: ViewXf, W: 
     const segs: [number, number][] = []; let s0 = -ea;
     for (const op of ops) { const a = op.t - op.width / 2, b = op.t + op.width / 2; if (a > s0) segs.push([s0, a]); s0 = Math.max(s0, b); }
     if (L + eb > s0) segs.push([s0, L + eb]);
-    c.fillStyle = selWall === w.id ? '#1c7ed6' : (o.print ? '#2b2b2b' : '#3d3a35');
+    c.fillStyle = selWall === w.id ? '#1c7ed6' : o.review ? 'rgba(224,49,49,0.78)' : (o.print ? '#2b2b2b' : (document.body.classList.contains('sun') ? '#000' : '#3d3a35'));
     for (const [s1, s2] of segs) {
       const p1 = { x: w.a.x + d.x * s1, y: w.a.y + d.y * s1 }, p2 = { x: w.a.x + d.x * s2, y: w.a.y + d.y * s2 };
       c.beginPath(); c.moveTo(p1.x + n.x * h, p1.y + n.y * h); c.lineTo(p2.x + n.x * h, p2.y + n.y * h); c.lineTo(p2.x - n.x * h, p2.y - n.y * h); c.lineTo(p1.x - n.x * h, p1.y - n.y * h); c.closePath(); c.fill();
@@ -445,7 +456,7 @@ export function drawPlan(c: CanvasRenderingContext2D, P: Project, v: ViewXf, W: 
     // openings symbols
     for (const op of ops) {
       const ctr = pointOnWall(w, op.t); const a = { x: ctr.x - d.x * op.width / 2, y: ctr.y - d.y * op.width / 2 }, b = { x: ctr.x + d.x * op.width / 2, y: ctr.y + d.y * op.width / 2 };
-      const isSel = o.sel?.kind === 'opening' && o.sel.id === op.id; const col = isSel ? '#1c7ed6' : '#444';
+      const isSel = o.sel?.kind === 'opening' && o.sel.id === op.id; const col = isSel ? '#1c7ed6' : o.review ? (op.kind === 'window' ? '#2b8a3e' : '#1864ab') : '#444';
       c.strokeStyle = col; c.lineWidth = 1.5 * px;
       // jamb lines
       c.beginPath(); for (const q of [a, b]) { c.moveTo(q.x + n.x * h, q.y + n.y * h); c.lineTo(q.x - n.x * h, q.y - n.y * h); } c.stroke();

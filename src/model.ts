@@ -18,7 +18,18 @@ export interface Project {
   id: string; name: string; client: string; address: string; notes: string; units: UnitSystem;
   walls: Wall[]; openings: Opening[]; rooms: Room[]; objects: Obj[]; measures: Measure[];
   background: Background | null; scan: ScanRef | null; defaults: Defaults; prices: Record<string, number>; markup: number; photos: PhotoDesign[]; created: number; updated: number; version: number;
+  lot?: Pt[] | null; geo?: { lat: number; lon: number; address: string; parcel?: string; source?: string } | null;
+  lineCfg?: Record<string, { waste?: number; markup?: number }>; tcfg?: Partial<TakeoffCfg>; options?: ProposalOption[];
+  setbacks?: { front: number; side: number; rear: number; pool: number } | null; northDeg?: number;
 }
+export interface TakeoffCfg { palletSf: number; baseIn: number; sandIn: number; baseTonsPerYd: number; slabIn: number; mulchIn: number; rockIn: number; soilIn: number; sodWaste: number; paverWaste: number }
+export const TCFG_DEFAULTS: TakeoffCfg = { palletSf: 450, baseIn: 4, sandIn: 1, baseTonsPerYd: 1.4, slabIn: 4, mulchIn: 3, rockIn: 2, soilIn: 4, sodWaste: 5, paverWaste: 5 };
+export interface ProposalOption { name: string; desc: string; factor: number; price?: number | null }
+export const DEFAULT_OPTIONS: ProposalOption[] = [
+  { name: 'Good', desc: 'Standard materials, as drawn.', factor: 1 },
+  { name: 'Better', desc: 'Upgraded materials and finishes.', factor: 1.15 },
+  { name: 'Best', desc: 'Premium materials, extended warranty.', factor: 1.3 },
+];
 export type SelKind = 'wall' | 'opening' | 'room' | 'object' | 'measure' | 'background' | 'scan' | 'joint';
 export interface Selection { kind: SelKind; id: string; pt?: Pt }
 
@@ -46,6 +57,9 @@ export const FLOORS: Record<string, { label: string; color: string }> = {
   marble: { label: 'Marble', color: '#ece9e4' },
   darkwood: { label: 'Dark wood', color: '#6b4a32' },
   graytile: { label: 'Gray tile', color: '#9a9a96' },
+  soil: { label: 'Topsoil / fill', color: '#5a4636' },
+  travertine: { label: 'Travertine', color: '#e3d5bd' },
+  stamped: { label: 'Stamped concrete', color: '#a98f7a' },
 };
 
 export const OBJECT_PRESETS = CAT_BY_KEY;
@@ -62,6 +76,8 @@ class Store {
   private listeners: Listener[] = [];
   private pending: string | null = null;
   dirty = false;
+  /** customer view-only link: every edit is rolled back */
+  readOnly = false;
 
   on(fn: Listener) { this.listeners.push(fn); }
   emit(what = 'change') { for (const l of this.listeners) l(what); }
@@ -72,6 +88,7 @@ class Store {
   }
   /** One-shot mutation with undo. */
   mutate(fn: (p: Project) => void, what = 'change') {
+    if (this.readOnly) return;
     const before = JSON.stringify(this.p);
     fn(this.p);
     this.pushUndo(before); this.emit(what);
@@ -81,6 +98,7 @@ class Store {
   end() {
     if (this.pending == null) return;
     const before = this.pending; this.pending = null;
+    if (this.readOnly) { this.p = JSON.parse(before); this.emit('change'); return; }
     if (before !== JSON.stringify(this.p)) this.pushUndo(before);
     this.emit('change');
   }
@@ -116,7 +134,7 @@ export function migrate(p: any): Project {
   const base = newProject();
   const out = { ...base, ...p };
   out.defaults = { ...base.defaults, ...(p.defaults || {}) };
-  if (!out.prices) out.prices = {}; if (out.markup == null) out.markup = 0;
+  if (!out.prices) out.prices = {}; if (out.markup == null) out.markup = 0; if (!out.lineCfg) out.lineCfg = {}; if (out.lot === undefined) out.lot = null;
   for (const k of ['walls', 'openings', 'rooms', 'objects', 'measures', 'photos']) if (!Array.isArray(out[k])) out[k] = [];
   return out as Project;
 }

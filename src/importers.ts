@@ -27,6 +27,18 @@ export async function blueprintToImageBlob(file: File, page = 1): Promise<{ blob
   const blob: Blob = await new Promise(r => cv.toBlob(b => r(b!), 'image/jpeg', 0.9));
   return { blob, w: cv.width, h: cv.height };
 }
+/** Score every page of a PDF set by drawing-line density; the floor plan is usually the page with the most long straight lines. */
+export async function pdfPageScores(file: File, score: (cv: HTMLCanvasElement) => number, maxPages = 15): Promise<{ pages: number; scores: number[] }> {
+  const pdfjs: any = await import('pdfjs-dist'); pdfjs.GlobalWorkerOptions.workerSrc = (await import('pdfjs-dist/build/pdf.worker.min.mjs?url')).default;
+  const doc = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise; const scores: number[] = [];
+  for (let i = 1; i <= Math.min(doc.numPages, maxPages); i++) {
+    const pg = await doc.getPage(i); const vp0 = pg.getViewport({ scale: 1 }); const vp = pg.getViewport({ scale: 900 / Math.max(vp0.width, vp0.height) });
+    const cv = document.createElement('canvas'); cv.width = Math.floor(vp.width); cv.height = Math.floor(vp.height); const c = cv.getContext('2d')!; c.fillStyle = '#fff'; c.fillRect(0, 0, cv.width, cv.height);
+    await pg.render({ canvasContext: c, viewport: vp, canvas: cv }).promise; scores.push(score(cv));
+  }
+  return { pages: doc.numPages, scores };
+}
+export async function blobToCanvas(b: Blob): Promise<HTMLCanvasElement> { const im = await loadImage(b); const cv = document.createElement('canvas'); cv.width = im.naturalWidth; cv.height = im.naturalHeight; cv.getContext('2d')!.drawImage(im, 0, 0); URL.revokeObjectURL(im.src); return cv; }
 function loadImage(file: Blob): Promise<HTMLImageElement> {
   return new Promise((res, rej) => { const im = new Image(); im.onload = () => res(im); im.onerror = () => rej(new Error('Could not read that image (HEIC? try JPG/PNG/screenshot)')); im.src = URL.createObjectURL(file); });
 }

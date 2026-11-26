@@ -9,8 +9,10 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "heic2any": "^0.0.4",
     "jspdf": "^4.2.1",
     "pdfjs-dist": "^6.5.438",
+    "tesseract.js": "^7.0.0",
     "three": "^0.187.0"
   },
   "devDependencies": {

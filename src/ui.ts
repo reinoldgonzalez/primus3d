@@ -41,3 +41,14 @@ export function pickFile(accept: string, capture?: string): Promise<File | null>
     i.click();
   });
 }
+/**
+ * A button that opens the file picker DIRECTLY from the user's tap (a <label> wrapping a real file input).
+ * iOS Safari blocks pickers opened later from code (after a modal closes / setTimeout), so always use this in menus.
+ */
+export function fileBtn(cls: string, accept: string, kids: (Node | string)[], onFiles: (f: File[]) => void, opts: { multiple?: boolean; capture?: string; id?: string } = {}) {
+  const inp = h('input', { type: 'file', accept: accept || null, class: 'fileinp', multiple: opts.multiple || null, capture: opts.capture || null }) as HTMLInputElement;
+  const lab = h('label', { class: cls, id: opts.id || null, role: 'button', tabindex: '0' }, inp, ...kids);
+  inp.addEventListener('change', () => { const fs = [...(inp.files || [])]; inp.value = ''; if (fs.length) { closeModal(); onFiles(fs); } });
+  lab.addEventListener('keydown', (e: KeyboardEvent) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); inp.click(); } });
+  return lab;
+}

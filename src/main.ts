@@ -5,15 +5,19 @@ import { View3D } from './view3d';
 import { PhotoView, PHOTO_MATS, PHOTO_SPRITES } from './photo';
 import { fmtLen, fmtArea, parseLen, setUnits, getUnits, fmtAngle, FT, IN } from './units';
 import { saveProject, listProjects, loadProject, deleteProject, lastProjectId, exportProjectJSON, importProjectJSON, requestPersist } from './storage';
-import { blueprintToImageBlob, scanFormat, loadScanObject, parseRoomPlanJSON, detectArchFromScene, applyArch } from './importers';
-import { exportPNG, exportPDF, shareOrDownload, renderPlanCanvas } from './export';
+import { blueprintToImageBlob, scanFormat, loadScanObject, parseRoomPlanJSON, detectArchFromScene, applyArch, pdfPageScores, blobToCanvas } from './importers';
+import { analyze, deskew, lineDensity, looksLikePlan, Detection } from './autoconvert';
+import { geocode, leeParcel, usgsImage, toLocal, setbacks, edgeName, lotArea } from './site';
+import { shareUrl, decodeProject, getBiz, setBiz } from './share';
+import { exportPNG, exportPDF, shareOrDownload, renderPlanCanvas, exportPermitPDF } from './export';
 import { exportDXF } from './dxf';
 import { CATALOG, CATEGORIES, OPENINGS, CAT_BY_KEY, PAINTS, FINISHES } from './catalog';
-import { takeoff, money } from './takeoff';
+import { takeoff, money, cfg, options, optionPrice, priceLists, savePriceList } from './takeoff';
 import { TEMPLATES } from './templates';
-import { $, h, toast, modal, prompt, pickFile, closeModal } from './ui';
+import { $, h, toast, modal, prompt, closeModal, fileBtn } from './ui';
 
 type View = 'plan' | '3d' | 'walk' | 'photo';
+let fitDirty = true; // re-frame the 3D camera next time 3D is shown (after load / convert / template)
 let view: View = 'plan'; let split = false;
 
 // ---------- DOM ----------
@@ -34,15 +38,17 @@ photo.onChange = () => renderDock();
 // ---------- views ----------
 function setView(v: View) {
   view = v; app.dataset.view = v; app.classList.toggle('split', split && (v === 'plan' || v === '3d'));
-  document.querySelectorAll('#views button').forEach(b => b.classList.toggle('on', (b as HTMLElement).dataset.v === v));
+  document.querySelectorAll('#views button[data-v]').forEach(b => b.classList.toggle('on', (b as HTMLElement).dataset.v === v));
   const show3d = v === '3d' || v === 'walk' || (split && v === 'plan');
   plan.setVisible(v === 'plan' || (split && v === '3d')); v3.setActive(show3d);
   if (v === 'walk') v3.setMode('walk'); else if (v3.mode === 'walk') v3.setMode('orbit');
-  if (v === 'photo') { photo.resize(); if (!store.p.photos.length) setTimeout(() => newPhotoDesign(), 50); else if (!photo.design) photo.open(store.p.photos[store.p.photos.length - 1]); }
+  if (show3d) requestAnimationFrame(() => { v3.resize(); if (fitDirty) { v3.fitView(); fitDirty = false; } });
+  if (v === 'photo') { photo.resize(); if (store.p.photos.length && !photo.design) photo.open(store.p.photos[store.p.photos.length - 1]); }
+  renderPhotoEmpty();
   if (v !== 'plan') plan.setTool('select');
   renderDock(); updateHint(); renderCtx();
 }
-document.querySelectorAll('#views button').forEach(b => b.addEventListener('click', () => setView((b as HTMLElement).dataset.v as View)));
+document.querySelectorAll('#views button[data-v]').forEach(b => b.addEventListener('click', () => setView((b as HTMLElement).dataset.v as View)));
 $('#splitBtn').addEventListener('click', () => { split = !split; $('#splitBtn').classList.toggle('on', split); setView(view === 'walk' || view === 'photo' ? 'plan' : view); setTimeout(() => { plan.resize(); v3.resize(); }, 50); });
 
 // ---------- dock (tools) ----------
@@ -72,7 +78,7 @@ function renderDock() {
     { id: 'orbit', icon: '🔄', label: 'Back to 3D', act: () => setView('3d') },
   ];
   else btns = [
-    { id: 'pnew', icon: '📷', label: 'New photo', act: () => newPhotoDesign() },
+    { id: 'pnew', icon: '📷', label: 'New photo', act: () => {} },
     { id: 'psel', icon: '👆', label: 'Select', on: photo.tool === 'select', act: () => { photo.tool = 'select'; photo.draft = []; renderDock(); updateHint(); photo.draw(); } },
     { id: 'pplant', icon: '🌴', label: 'Plants & items', on: photo.tool === 'sprite', act: () => photoSpritePicker() },
     { id: 'parea', icon: '🟫', label: 'Material area', on: photo.tool === 'area', act: () => photoMatPicker() },
@@ -81,6 +87,7 @@ function renderDock() {
     { id: 'pbefore', icon: '👁️', label: 'Hold: before', act: () => {} },
   ];
   for (const b of btns) {
+    if (b.id === 'pnew') { d.append(fileBtn('tool', 'image/*', [h('span', { class: 'ti' }, b.icon), h('span', { class: 'tl' }, b.label)], fs => newPhotoDesign(fs[0]), { id: 'tool-pnew' })); continue; }
     const el = h('button', { class: 'tool' + (b.on ? ' on' : ''), id: 'tool-' + b.id, onclick: b.act }, h('span', { class: 'ti' }, b.icon), h('span', { class: 'tl' }, b.label));
     if (b.id === 'pbefore') { const on = () => { photo.before = true; photo.draw(); }, off = () => { photo.before = false; photo.draw(); }; el.addEventListener('pointerdown', on); el.addEventListener('pointerup', off); el.addEventListener('pointerleave', off); el.addEventListener('pointercancel', off); }
     d.append(el);
@@ -99,6 +106,7 @@ const HINTS: Record<string, string> = {
   object: 'Tap where to place it.',
 };
 function updateHint() {
+  app.classList.toggle('calib', (view === 'plan' && plan.tool === 'calibrate') || (view === '3d' && (v3.tool === 'calScan' || v3.tool === 'floorScan')));
   const el = $('#hint'); let t = '';
   if (view === 'plan') { t = HINTS[plan.tool] || ''; if (plan.tool === 'wall' && plan.wallStart) t = 'Tap the next corner, or type the length below and press Add.'; if (plan.tool === 'calibrate' && plan.calA) t = 'Now tap the other end of the known length.'; if (!store.p.walls.length && plan.tool === 'select' && store.p.scan) t = 'The dark lines are a slice through your scan. Use 📏 Draw walls to trace over them (Scan settings: ☰ menu).'; else if (!store.p.walls.length && !store.p.rooms.length && plan.tool === 'select' && !store.p.background) t = 'Start with ⬛ Quick room (type the size) or 📏 Draw walls. Tip: ☰ menu has blueprint, scan and templates.'; }
   else if (view === '3d') t = v3.tool === 'measure' ? 'Tap two points on the model or scan to measure.' : v3.tool === 'calScan' ? 'Tap two points on the scan whose real distance you know.' : v3.tool === 'floorScan' ? 'Tap a spot on the scan floor.' : 'One finger: orbit · two fingers: zoom/pan · tap to select, drag a selected item to move it.';
@@ -111,6 +119,7 @@ let hintT: any;
 // ---------- wall draft bar (exact lengths) ----------
 function updateDraftBar() {
   const bar = $('#draftbar');
+  if (view === 'plan' && plan.tool === 'calibrate') { bar.innerHTML = ''; bar.dataset.built = ''; bar.style.display = ''; bar.append(h('span', { class: 'calt' }, plan.calA ? '📏 Now tap the other end' : '📏 Tap both ends of a known length'), h('button', { class: 'btn', onclick: () => setTool('select') }, 'Cancel')); return; }
   if (view !== 'plan' || plan.tool !== 'wall' || !plan.wallStart) { bar.style.display = 'none'; return; }
   if (bar.style.display !== 'none' && bar.dataset.built) { const inp = bar.querySelector('input') as HTMLInputElement; if (document.activeElement !== inp && plan.cursor) inp.placeholder = fmtLen(dist(plan.wallStart, plan.cursor)); return; }
   bar.innerHTML = ''; bar.dataset.built = '1'; bar.style.display = '';
@@ -122,7 +131,7 @@ function updateDraftBar() {
     h('button', { class: 'btn sq', title: 'Left', onclick: () => add(Math.PI) }, '←'), h('button', { class: 'btn sq', title: 'Up', onclick: () => add(-Math.PI / 2) }, '↑'),
     h('button', { class: 'btn primary', onclick: () => { plan.finishWall(); } }, '✓ Done'));
 }
-store.on(() => { if (plan.tool !== 'wall') { $('#draftbar').style.display = 'none'; ($('#draftbar') as any).dataset.built = ''; } });
+store.on(() => { if (plan.tool !== 'wall' && plan.tool !== 'calibrate') { $('#draftbar').style.display = 'none'; ($('#draftbar') as any).dataset.built = ''; } });
 
 // ---------- selection: context toolbar + properties sheet ----------
 store.on(w => { if (w === 'select' || w === 'change' || w === 'load') { renderCtx(); if (sheetOpen === 'props') renderProps(); } if (w !== 'select') { renderTotals(); if (w !== 'live') scheduleAutosave(); } if (w !== 'live') updateHint(); renderTop(); });
@@ -217,7 +226,7 @@ function renderProps() {
       sec('Floor / surface material'), fsel,
       row(toggle('Outdoor', !!r.outdoor, v => M(() => { r.outdoor = v; })), toggle('Curved edges', !!r.smooth, v => M(() => { r.smooth = v; })), toggle('Concrete curbing', !!r.curb, v => M(() => { r.curb = v; })), r.outdoor ? null : toggle('Ceiling', r.showCeiling, v => M(() => { r.showCeiling = v; }))),
       h('p', { class: 'muted' }, 'Drag the white dots to move corners. Drag a small blue dot to add a corner. Curved edges makes smooth beds, paths and pool shapes.'),
-      row(h('button', { class: 'btn', onclick: () => wallsAroundRoom(r) }, 'Build walls around it'), h('button', { class: 'btn', onclick: () => duplicate() }, 'Duplicate'), r.pts.length > 3 ? h('button', { class: 'btn', onclick: () => M(() => { r.pts.pop(); }) }, 'Remove last corner') : null, h('button', { class: 'btn danger', onclick: deleteSel }, 'Delete')));
+      row(h('button', { class: 'btn', onclick: () => wallsAroundRoom(r) }, 'Build walls around it'), r.outdoor || !store.p.walls.length ? h('button', { class: 'btn', onclick: () => { M(() => { store.p.lot = r.pts.map(q => ({ ...q })); store.p.rooms = store.p.rooms.filter(x => x.id !== r.id); }); store.select(null); toast('Lot lines set — setbacks show in orange.'); } }, '📐 Use as lot lines') : null, h('button', { class: 'btn', onclick: () => duplicate() }, 'Duplicate'), r.pts.length > 3 ? h('button', { class: 'btn', onclick: () => M(() => { r.pts.pop(); }) }, 'Remove last corner') : null, h('button', { class: 'btn danger', onclick: deleteSel }, 'Delete')));
   } else if (s.kind === 'object') {
     const o = it as Obj; const cat = CAT_BY_KEY[o.kind];
     const fin = h('select', { class: 'inp', onchange: (e: any) => M(() => { o.finish = e.target.value; }) }, ...Object.entries(FINISHES).map(([k, f]) => h('option', { value: k, selected: (o.finish || cat?.finish || 'satin') === k }, f.label)));
@@ -247,19 +256,33 @@ function renderTotals() {
   const el = $('#totals'); el.innerHTML = ''; el.append(h('span', {}, parts.join(' · ') || 'Nothing drawn yet'), h('button', { class: 'tot', onclick: () => openTakeoff() }, t.total ? money(t.total) : '$ Set prices'));
 }
 async function openTakeoff() {
-  const t = takeoff(); const P = store.p as any;
-  const tbl = h('table', { class: 'tk' }, h('tr', {}, h('th', {}, 'Item'), h('th', {}, 'Qty'), h('th', {}, 'Price / unit'), h('th', {}, 'Total')));
+  const t = takeoff(); const P = store.p; const lc = () => (P.lineCfg ||= {});
+  const num = (v: number | string, set: (n: number) => void, ph = '', cls = 'inp sm') => { const i = h('input', { class: cls, inputmode: 'decimal', value: v === '' || v == null ? '' : String(v), placeholder: ph }) as HTMLInputElement; i.addEventListener('change', () => { store.mutate(() => set(parseFloat(i.value) || 0)); openTakeoff(); }); return i; };
+  const tbl = h('table', { class: 'tk' }, h('tr', {}, h('th', {}, 'Item'), h('th', {}, 'Qty'), h('th', {}, '$ / unit'), h('th', {}, 'Waste %'), h('th', {}, 'Markup %'), h('th', {}, 'Total')));
   for (const l of t.lines) {
-    const inp = h('input', { class: 'inp sm', inputmode: 'decimal', value: l.price ? String(l.price) : '', placeholder: '$' }) as HTMLInputElement;
-    inp.addEventListener('change', () => { store.mutate(() => { P.prices[l.key] = parseFloat(inp.value) || 0; }); openTakeoff(); });
-    tbl.append(h('tr', {}, h('td', {}, l.label), h('td', {}, `${l.qty} ${l.unit}`), h('td', {}, inp), h('td', {}, l.price ? money(l.qty * l.price) : '—')));
+    tbl.append(h('tr', {}, h('td', {}, l.label, l.note ? h('div', { class: 'tnote' }, l.note) : null), h('td', { class: 'nw' }, `${l.qty} ${l.unit}`),
+      h('td', {}, num(l.price || '', v => { P.prices[l.key] = v; }, '$')), h('td', {}, num(l.waste, v => { (lc()[l.key] ||= {}).waste = v; })), h('td', {}, num(l.markup, v => { (lc()[l.key] ||= {}).markup = v; })),
+      h('td', { class: 'nw' }, l.price ? money(l.total) : '—')));
   }
-  const mk = h('input', { class: 'inp sm', inputmode: 'decimal', value: String(P.markup || 0) }) as HTMLInputElement; mk.addEventListener('change', () => { store.mutate(() => { P.markup = parseFloat(mk.value) || 0; }); openTakeoff(); });
-  const body = h('div', {}, t.lines.length ? tbl : h('p', {}, 'Draw rooms, areas, walls or add items and the quantities show up here automatically.'),
-    h('div', { class: 'row' }, h('label', { class: 'field' }, h('span', {}, 'Markup / overhead %'), mk), h('div', { class: 'field' }, h('span', {}, 'Estimated total'), h('b', { class: 'big' }, money(t.total)))),
-    h('p', { class: 'muted' }, 'Enter your own installed prices per unit. They are saved with this project. Quantities come from the drawing, so check them on site.'));
-  const r = await modal('Takeoff & estimate', body, [{ label: 'Close', value: null }, { label: '📄 Proposal PDF', primary: true, value: 'pdf' }], { wide: true });
-  if (r === 'pdf') doExportPDF();
+  const C = cfg(P); const setC = (k: keyof typeof C) => (v: number) => { P.tcfg = { ...(P.tcfg || {}), [k]: v }; };
+  const settings = h('details', { class: 'tset' }, h('summary', {}, '⚙️ Material settings (depths, pallet size)'), h('div', { class: 'row wrap' },
+    ...([['palletSf', 'Sod sq ft / pallet'], ['baseIn', 'Paver base depth (in)'], ['baseTonsPerYd', 'Base tons per cu yd'], ['sandIn', 'Bedding sand (in)'], ['slabIn', 'Concrete slab (in)'], ['mulchIn', 'Mulch depth (in)'], ['rockIn', 'Rock depth (in)'], ['soilIn', 'Topsoil depth (in)']] as const)
+      .map(([k, l]) => h('label', { class: 'field sm' }, h('span', {}, l), num(C[k], setC(k))))));
+  // price lists
+  const lists = priceLists(); const sel = h('select', { class: 'inp' }, h('option', { value: '' }, 'Load a saved price list…'), ...Object.keys(lists).map(n => h('option', { value: n }, n))) as HTMLSelectElement;
+  sel.addEventListener('change', () => { const L = lists[sel.value]; if (!L) return; store.mutate(p => { p.prices = { ...L.prices }; p.lineCfg = { ...L.lineCfg }; p.markup = L.markup; }); toast('Prices loaded: ' + sel.value); openTakeoff(); });
+  const plRow = h('div', { class: 'row wrap' }, sel, h('button', { class: 'btn', onclick: async () => { const n = await prompt('Save price list', 'Name for this price list (e.g. “2027 pavers”)', ''); if (n) { savePriceList(n, store.p); toast('Saved. Use it on any project.'); } openTakeoff(); } }, '💾 Save prices as list'));
+  // good / better / best
+  const opts = options(P).map(o => ({ ...o })); const saveOpts = () => store.mutate(p => { p.options = opts; });
+  const otbl = h('table', { class: 'tk' }, h('tr', {}, h('th', {}, 'Option'), h('th', {}, 'What is included'), h('th', {}, '× estimate'), h('th', {}, 'Fixed price'), h('th', {}, 'Price')));
+  opts.forEach(o => { const nm = h('input', { class: 'inp sm', value: o.name }) as HTMLInputElement; nm.onchange = () => { o.name = nm.value; saveOpts(); }; const ds = h('input', { class: 'inp', value: o.desc }) as HTMLInputElement; ds.onchange = () => { o.desc = ds.value; saveOpts(); };
+    otbl.append(h('tr', {}, h('td', {}, nm), h('td', {}, ds), h('td', {}, num(o.factor, v => { o.factor = v || 1; P.options = opts; })), h('td', {}, num(o.price || '', v => { o.price = v || null; P.options = opts; }, 'auto')), h('td', { class: 'nw' }, money(optionPrice(o, t.total))))); });
+  const body = h('div', {}, t.lines.length ? h('div', { class: 'tkwrap' }, tbl) : h('p', {}, 'Draw rooms, areas, walls or add items and the quantities show up here automatically.'),
+    h('div', { class: 'row' }, h('label', { class: 'field' }, h('span', {}, 'Default markup % (new lines)'), num(P.markup || 0, v => { P.markup = v; })), h('div', { class: 'field' }, h('span', {}, 'Estimated total'), h('b', { class: 'big' }, money(t.total)))),
+    plRow, settings, h('h4', {}, 'Proposal options (good / better / best)'), h('div', { class: 'tkwrap' }, otbl),
+    h('p', { class: 'muted' }, 'Prices are yours: type installed prices per unit once, save them as a price list, reuse on every job. Quantities come from the drawing — check them on site.'));
+  const r = await modal('Takeoff & estimate', body, [{ label: 'Close', value: null }, { label: '🔗 Customer link', value: 'link' }, { label: '📄 Proposal PDF', primary: true, value: 'pdf' }], { wide: true });
+  if (r === 'pdf') doExportPDF(); if (r === 'link') shareLink();
 }
 
 // ---------- top bar ----------
@@ -277,6 +300,13 @@ window.addEventListener('keydown', e => {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); e.shiftKey ? store.redo() : store.undo(); }
   else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') { e.preventDefault(); store.redo(); }
   else if (e.key === 'Delete' || e.key === 'Backspace') { if (store.sel) deleteSel(); }
+  else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') { e.preventDefault(); saveNow(); toast('Saved'); }
+  else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'd') { e.preventDefault(); duplicate(); }
+  else if (!e.ctrlKey && !e.metaKey && !e.altKey && e.key.length === 1 && !store.readOnly) {
+    const k = e.key.toLowerCase(); const views: Record<string, View> = { '1': 'plan', '2': '3d', '3': 'walk', '4': 'photo' };
+    if (views[k]) setView(views[k]); else if (k === 'v') setTool('select'); else if (k === 'w') setTool('wall'); else if (k === 'r') setTool('room'); else if (k === 'm') setTool('measure'); else if (k === 'd') openCatalog('Doors'); else if (k === 'i') openCatalog(); else if (k === 'q') quickRoom(); else if (k === '?') help(); else if (k === 'f') { plan.fit(); v3.fitView(); }
+  }
+  else if (e.key.startsWith('Arrow') && store.sel?.kind === 'object') { e.preventDefault(); const st = e.shiftKey ? FT : IN; const dx = e.key === 'ArrowLeft' ? -st : e.key === 'ArrowRight' ? st : 0, dy = e.key === 'ArrowUp' ? -st : e.key === 'ArrowDown' ? st : 0; const o = findSel(store.p, store.sel); store.mutate(() => { o.x += dx; o.y += dy; }); }
   else if (e.key === 'Escape') { if (plan.tool === 'wall') plan.finishWall(); else if (plan.tool === 'room') plan.finishRoom(); else { setTool('select'); store.select(null); } }
 });
 
@@ -290,23 +320,28 @@ async function projectInfo() {
 
 // ---------- menus ----------
 async function openMenu() {
-  const items: [string, string, () => void][] = [
-    ['🆕', 'New project', () => startWizard(true)], ['📂', 'My projects', () => projectsList()], ['🧬', 'Save a copy (design option B)', () => saveVariant()],
-    ['🗺️', 'Import blueprint, survey or aerial (image/PDF)', () => importBlueprint()], ['📱', 'Import 3D scan (iPhone LiDAR, Polycam, GLB/OBJ/PLY/USDZ, RoomPlan)', () => importScan()],
-    ['🎥', 'Photos/video → 3D model (how it works)', () => videoHelp()], ['🧰', 'Templates', () => templatesMenu()],
-    ['📥', 'Open project file (.json)', () => importJSON()], ['💾', 'Save project file (.json backup)', () => exportJSON()],
-    ['📏', `Units: ${getUnits() === 'imperial' ? 'feet & inches' : 'metric'} (tap to switch)`, () => { const u = getUnits() === 'imperial' ? 'metric' : 'imperial'; setUnits(u); store.mutate(p => { p.units = u; }); }],
-    ['⚙️', 'Default wall height & thickness', () => defaultsMenu()], ['💲', 'Takeoff & prices', () => openTakeoff()], ['❓', 'Help & tips', () => help()],
-  ];
-  const list = h('div', { class: 'menu' }, ...items.map(([i, l, fn]) => h('button', { class: 'mi', onclick: () => { closeModal(); fn(); } }, h('span', { class: 'mii' }, i), l)));
-  if (store.p.background) list.prepend(h('button', { class: 'mi', onclick: () => { closeModal(); store.select({ kind: 'background', id: 'bg' }); openSheet('props'); } }, h('span', { class: 'mii' }, '🖼️'), 'Blueprint settings (scale, opacity, lock)'));
-  if (store.p.scan) list.prepend(h('button', { class: 'mi', onclick: () => { closeModal(); store.select({ kind: 'scan', id: 'scan' }); openSheet('props'); } }, h('span', { class: 'mii' }, '🧊'), 'Scan settings (scale, floor, walls)'));
+  const I = (i: string, l: string, fn: () => void) => h('button', { class: 'mi', onclick: () => { closeModal(); fn(); } }, h('span', { class: 'mii' }, i), l);
+  const F = (i: string, l: string, accept: string, fn: (f: File[]) => void, multiple = false) => fileBtn('mi', accept, [h('span', { class: 'mii' }, i), l], fn, { multiple });
+  const list = h('div', { class: 'menu' },
+    I('🆕', 'New project', () => startWizard(true)), I('📂', 'My projects', () => projectsList()), I('🧬', 'Save a copy (design option B)', () => saveVariant()),
+    F('⬆️', 'Upload plan or photos (auto-convert to 3D)', 'image/*,application/pdf,.pdf,video/*,.glb,.gltf,.obj,.ply,.stl,.usdz,.json,.heic', fs => uploadFiles(fs), true),
+    I('📍', 'Start from address (lot lines + aerial)', () => startFromAddress()), I('📐', 'Lot lines & setbacks', () => lotPanel()),
+    F('🗺️', 'Trace a blueprint / aerial by hand (no auto-convert)', 'image/*,application/pdf,.pdf,.heic', fs => importBlueprint(fs[0])),
+    I('📱', 'Scan with iPhone / iPad LiDAR (free apps)', () => lidarHelp()), F('🧊', 'Import 3D scan file (GLB, OBJ, PLY, USDZ, RoomPlan)', '', fs => importScan(fs[0])),
+    I('🏊', 'Add pool + deck + cage + equipment pad', () => poolPreset()), I('🧰', 'Templates', () => templatesMenu()),
+    F('📥', 'Open project file (.json)', '.json,application/json', fs => importJSON(fs[0])), I('💾', 'Save project file (.json backup)', () => exportJSON()),
+    I('📏', `Units: ${getUnits() === 'imperial' ? 'feet & inches' : 'metric'} (tap to switch)`, () => { const u = getUnits() === 'imperial' ? 'metric' : 'imperial'; setUnits(u); store.mutate(p => { p.units = u; }); }),
+    I('🏢', 'Business info (proposals & customer links)', () => bizMenu()), I('☀️', 'Display: sunlight mode & text size', () => displayMenu()),
+    I('⚙️', 'Default wall height & thickness', () => defaultsMenu()), I('💲', 'Takeoff, prices & options', () => openTakeoff()), I('❓', 'Help & tips', () => help()));
+  if (store.p.background) list.prepend(I('🖼️', 'Blueprint settings (scale, opacity, lock)', () => { store.select({ kind: 'background', id: 'bg' }); openSheet('props'); }));
+  if (store.p.scan) list.prepend(I('🧊', 'Scan settings (scale, floor, walls)', () => { store.select({ kind: 'scan', id: 'scan' }); openSheet('props'); }));
   modal('Menu', list, []);
 }
 async function shareMenu() {
   const r = await modal('Share / export', h('div', { class: 'menu' },
-    ...([['pdf', '📄', 'Proposal PDF (plan, dimensions, takeoff, 3D view)'], ['png', '🖼️', 'Floor plan image (PNG)'], ['shot', '📸', '3D view screenshot'], ['photo', '🌴', 'Photo design image'], ['dxf', '📐', 'CAD file (DXF)'], ['json', '💾', 'Project file (backup / send to another device)']] as const)
+    ...([['link', '🔗', 'Customer link (view in 3D + approve, no login)'], ['pdf', '📄', 'Proposal PDF (plan, estimate, options, 3D view)'], ['permit', '🏛️', 'Permit sheets PDF (site plan, pool plan, barrier)'], ['png', '🖼️', 'Floor plan image (PNG)'], ['shot', '📸', '3D view screenshot'], ['photo', '🌴', 'Photo design image'], ['dxf', '📐', 'CAD file (DXF)'], ['json', '💾', 'Project file (backup / send to another device)']] as const)
       .map(([v, i, l]) => h('button', { class: 'mi', onclick: () => closeModal(v) }, h('span', { class: 'mii' }, i), l))), []);
+  if (r === 'link') shareLink(); if (r === 'permit') { toast('Building permit sheets…'); exportPermitPDF().then(b => shareOrDownload(b, fileBase() + '-permit.pdf')); }
   if (r === 'pdf') doExportPDF(); if (r === 'png') doExportPNG(); if (r === 'shot') doShot(); if (r === 'dxf') shareOrDownload(exportDXF(store.p), fileBase() + '.dxf'); if (r === 'json') exportJSON();
   if (r === 'photo') { if (view !== 'photo') setView('photo'); const b = await photo.exportBlob(); if (b) shareOrDownload(b, fileBase() + '-photo-design.jpg'); else toast('Make a photo design first'); }
 }
@@ -320,7 +355,7 @@ async function doExportPDF() {
   const b = await exportPDF(underlay, true, shot); shareOrDownload(b, fileBase() + '-proposal.pdf');
 }
 async function exportJSON() { const b = await exportProjectJSON(store.p); shareOrDownload(b, fileBase() + '.primus3d.json'); }
-async function importJSON() { const f = await pickFile('.json,application/json'); if (!f) return; try { const p = await importProjectJSON(await f.text()); p.id = uid(); store.load(p); afterLoad(); toast('Project opened'); } catch (e: any) { toast('Could not open: ' + e.message); } }
+async function importJSON(f: File) { if (!f) return; try { const p = await importProjectJSON(await f.text()); p.id = uid(); store.load(p); afterLoad(); toast('Project opened'); } catch (e: any) { toast('Could not open: ' + e.message); } }
 async function saveVariant() { await saveNow(); const p = JSON.parse(JSON.stringify(store.p)) as Project; p.id = uid(); p.name = (p.name || 'Project') + ' – option B'; p.created = p.updated = Date.now(); store.load(p); await saveNow(); toast('Copy made. You are now editing the copy; the original is in My projects.'); }
 async function defaultsMenu() {
   const D = store.p.defaults; const body = h('div', {},
@@ -407,14 +442,14 @@ $('#plan').addEventListener('pointerup', e => {
 }, true);
 
 // ---------- blueprint ----------
-async function importBlueprint() {
-  const f = await pickFile('image/*,application/pdf,.pdf'); if (!f) return;
+async function importBlueprint(f: File) {
+  if (!f) return; f = await heicFix(f);
   toast('Loading…'); try {
     let page = 1; let res = await blueprintToImageBlob(f, page);
     if (res.pages && res.pages > 1) { const s = await prompt('Which page?', `This PDF has ${res.pages} pages. Which page is the floor plan?`, '1'); page = parseInt(s || '1') || 1; if (page !== 1) res = await blueprintToImageBlob(f, page); }
     const id = uid(); store.assets.set(id, res.blob);
     // guess: 100 px per foot until calibrated; position to the view
-    const mpp = (40 * FT) / res.w; store.mutate(p => { p.background = { assetId: id, x: plan.v.cx - res.w * mpp / 2, y: plan.v.cy - res.h * mpp / 2, mpp, rot: 0, opacity: 0.6, wpx: res.w, hpx: res.h, locked: false, visible: true, name: f.name }; });
+    const mpp = (40 * FT) / res.w; /* temporary until the 2-point scale below is set */ store.mutate(p => { p.background = { assetId: id, x: plan.v.cx - res.w * mpp / 2, y: plan.v.cy - res.h * mpp / 2, mpp, rot: 0, opacity: 0.6, wpx: res.w, hpx: res.h, locked: false, visible: true, name: f.name }; });
     setView('plan'); plan.fit(); setTool('calibrate');
     modal('Set the scale', '<p><b>Step 1:</b> tap both ends of a dimension you know (e.g. a wall marked 12\'-0", or a lot line on a survey).</p><p><b>Step 2:</b> type the real length.</p><p>Then trace walls with 📏 Draw walls. Tip: zoom in for accurate taps.</p>', [{ label: 'Got it', primary: true }]);
   } catch (e: any) { toast('Could not load: ' + e.message, 5000); }
@@ -429,8 +464,8 @@ function renderBgPanel() {
 }
 
 // ---------- scans ----------
-async function importScan() {
-  const f = await pickFile(''); if (!f) return; const fmt = scanFormat(f.name);
+async function importScan(f: File) {
+  if (!f) return; const fmt = scanFormat(f.name);
   if (!fmt) { toast('Use a GLB, GLTF, OBJ, PLY, STL, USDZ or RoomPlan JSON file', 5000); return; }
   if (fmt === 'gltf') toast('Tip: .gltf files with separate textures may not load; export GLB instead.', 5000);
   toast('Loading scan…', 8000);
@@ -474,10 +509,10 @@ function videoHelp() {
 }
 
 // ---------- photo design ----------
-async function newPhotoDesign() {
-  const f = await pickFile('image/*'); if (!f) return;
+async function newPhotoDesign(f: File) {
+  if (!f) return; f = await heicFix(f); if (view !== 'photo') setView('photo');
   try { const { blob, w, h: hh } = await blueprintToImageBlob(f); const id = uid(); store.assets.set(id, blob);
-    const d = { id: uid(), assetId: id, name: f.name, wpx: w, hpx: hh, horizon: 0.42, items: [] as any[] }; store.mutate(p => { p.photos.push(d); }); await photo.open(d);
+    const d = { id: uid(), assetId: id, name: f.name, wpx: w, hpx: hh, horizon: 0.42, items: [] as any[] }; store.mutate(p => { p.photos.push(d); }); renderPhotoEmpty(); await photo.open(d);
     photo.tool = 'horizon'; renderDock(); updateHint(); toast('Drag the yellow line to where the ground meets the horizon, then add plants & materials.', 6000);
   } catch (e: any) { toast(e.message, 5000); }
 }
@@ -500,7 +535,7 @@ function centroid(pts: Pt[]) { return { x: pts.reduce((s, p) => s + p.x, 0) / pt
 
 // ---------- projects ----------
 async function saveNow() { try { const thumb = renderPlanCanvas(320, 220, { withBackground: false, underlay: null }).canvas.toDataURL('image/jpeg', 0.6); await saveProject(store.p, thumb); $('#saved').textContent = 'Saved'; } catch (e) { console.warn(e); $('#saved').textContent = 'Not saved!'; } }
-let saveT: any; function scheduleAutosave() { $('#saved').textContent = '…'; clearTimeout(saveT); saveT = setTimeout(saveNow, 1200); }
+let saveT: any; function scheduleAutosave() { if (store.readOnly) return; $('#saved').textContent = '…'; clearTimeout(saveT); saveT = setTimeout(saveNow, 1200); }
 async function projectsList() {
   const list = await listProjects(); const wrap = h('div', { class: 'plist' });
   for (const m of list) wrap.append(h('div', { class: 'pcard' + (m.id === store.p.id ? ' on' : '') }, h('button', { class: 'pmain', onclick: async () => { closeModal(); await saveNow(); const p = await loadProject(m.id); if (p) { store.load(p); afterLoad(); } } }, m.thumb ? h('img', { src: m.thumb, alt: '' }) : h('div', { class: 'nothumb' }, '🏠'), h('b', {}, m.name), h('small', {}, new Date(m.updated).toLocaleString())),
@@ -509,22 +544,25 @@ async function projectsList() {
   modal('My projects', h('div', {}, h('button', { class: 'btn primary', onclick: () => { closeModal(); startWizard(true); } }, '＋ New project'), wrap), [], { wide: true });
 }
 function templatesMenu() {
-  modal('Templates', h('div', { class: 'menu' }, ...TEMPLATES.map(t => h('button', { class: 'mi', onclick: async () => { closeModal(); await saveNow(); const p = migrate(t.make()); p.id = uid(); store.load(p); afterLoad(); toast(t.name + ' loaded — tap anything to change it'); } }, h('span', { class: 'mii' }, t.icon), h('span', {}, h('b', {}, t.name), h('br'), h('small', { class: 'muted' }, t.desc))))), []);
+  modal('Templates', h('div', { class: 'menu' }, ...TEMPLATES.map(t => h('button', { class: 'mi', onclick: async () => { closeModal(); await saveNow(); const p = migrate(t.make()); p.id = uid(); store.load(p); afterLoad(); fitDirty = true; toast(t.name + ' loaded — tap anything to change it'); } }, h('span', { class: 'mii' }, t.icon), h('span', {}, h('b', {}, t.name), h('br'), h('small', { class: 'muted' }, t.desc))))), []);
 }
 async function startWizard(isNew: boolean) {
-  const opts: [string, string, string, string][] = [
-    ['quick', '⬛', 'Quick room', 'Type width × length. Fastest start.'],
-    ['draw', '📏', 'Draw walls', 'Tap corners on the grid, type exact lengths.'],
-    ['blue', '🗺️', 'Trace a blueprint or aerial', 'Photo, screenshot or PDF of a plan, survey or Google Earth.'],
-    ['scan', '📱', 'iPhone LiDAR / 3D scan', 'Polycam, 3D Scanner App, RoomPlan: GLB, OBJ, PLY, USDZ.'],
-    ['photo', '🌴', 'Design on a yard photo', 'Snap the yard, drop in plants, pavers, mulch, curbing.'],
-    ['tpl', '🧰', 'Start from a template', 'Bedroom, kitchen, bath, 3/2 house, pool & cage.'],
-  ];
-  const r = await modal(isNew ? 'New project' : 'Welcome to Primus 3D', h('div', {}, isNew ? null : h('p', { class: 'muted' }, 'Design rooms, homes and yards to exact size and show customers in 3D. Free, works offline, saves on this device.'),
-    h('div', { class: 'wiz' }, ...opts.map(([v, i, t, d]) => h('button', { class: 'wizb', onclick: () => closeModal(v) }, h('span', { class: 'wi' }, i), h('b', {}, t), h('small', {}, d))))), [], { wide: true });
-  if (!r) return;
-  if (isNew) { await saveNow(); store.load(newProject()); afterLoad(); }
-  if (r === 'quick') quickRoom(); if (r === 'draw') setTool('wall'); if (r === 'blue') importBlueprint(); if (r === 'scan') importScan(); if (r === 'photo') { setView('photo'); } if (r === 'tpl') templatesMenu();
+  const fresh = async () => { if (isNew) { await saveNow(); store.load(newProject()); afterLoad(); } };
+  const big = (i: string, t: string, d: string) => [h('span', { class: 'wi' }, i), h('b', {}, t), h('small', {}, d)];
+  const more = h('div', { class: 'wiz more', hidden: true },
+    ...([['draw', '📏', 'Draw walls', 'Tap corners, type exact lengths.'], ['tpl', '🧰', 'Template', 'Bedroom, kitchen, bath, 3/2 house, pool.'], ['pool', '🏊', 'Pool + deck + cage', 'One tap, with equipment pad.'], ['lidar', '📱', 'iPhone/iPad LiDAR scan', 'Free apps, real size.'], ['yard', '🌴', 'Yard photo design', 'Before / after on a real photo.']] as const)
+      .map(([v, i, t, d]) => h('button', { class: 'wizb sm', onclick: () => closeModal(v) }, ...big(i, t, d))),
+    fileBtn('wizb sm', '.json,application/json', big('📥', 'Open a project file', '.json backup from another device'), async fs => { await fresh(); importJSON(fs[0]); }));
+  const body = h('div', {}, isNew ? null : h('p', { class: 'muted' }, 'Design homes and yards to exact size and show customers in 3D. Free, works offline, saves on this device.'),
+    h('div', { class: 'wiz three' },
+      fileBtn('wizb big', 'image/*,application/pdf,.pdf,video/*,.glb,.obj,.ply,.usdz,.json,.heic', big('⬆️', 'Upload plan or photo', 'PDF or picture of a plan → 3D walls, doors, rooms. Yard photo → design on it.'), async fs => { await fresh(); uploadFiles(fs); }, { multiple: true, id: 'wiz-upload' }),
+      h('button', { class: 'wizb big', onclick: () => closeModal('addr') }, ...big('📍', 'Start from address', 'Lot lines + aerial, then add house, pool, pavers.')),
+      h('button', { class: 'wizb big', onclick: () => closeModal('quick') }, ...big('⬛', 'Quick room', 'Type width × length. Fastest start.'))),
+    h('button', { class: 'linkbtn', onclick: (e: Event) => { more.hidden = !more.hidden; (e.target as HTMLElement).textContent = more.hidden ? 'More ways to start ▾' : 'Less ▴'; } }, 'More ways to start ▾'), more,
+    h('p', { class: 'free' }, '✓ Auto-convert is free — no subscription, nothing uploaded.'));
+  const r = await modal(isNew ? 'New project' : 'Welcome to Primus 3D', body, [], { wide: true });
+  if (!r) return; await fresh();
+  if (r === 'quick') quickRoom(); if (r === 'draw') setTool('wall'); if (r === 'addr') startFromAddress(); if (r === 'lidar') lidarHelp(); if (r === 'yard') setView('photo'); if (r === 'tpl') templatesMenu(); if (r === 'pool') poolPreset();
 }
 function help() {
   modal('How to use Primus 3D', `<ol class="help">
@@ -540,18 +578,256 @@ function help() {
   <p class="muted">Accuracy: the drawing is exactly what you type. Scans and blueprints are only as good as their scale — always check one known length.</p>`, [{ label: 'Got it', primary: true }], { wide: true });
 }
 
+// =====================================================================
+// Upload → auto-convert (plans) / yard photo (photos) / LiDAR / Creator
+// =====================================================================
+async function heicFix(f: File): Promise<File> {
+  if (!/\.hei[cf]$/i.test(f.name) && !/hei[cf]/i.test(f.type)) return f;
+  const ok = await new Promise<boolean>(r => { const im = new Image(); im.onload = () => r(true); im.onerror = () => r(false); im.src = URL.createObjectURL(f); });
+  if (ok) return f; // Safari decodes HEIC itself
+  toast('Converting iPhone photo (HEIC)…', 8000);
+  const heic2any: any = (await import('heic2any')).default; const out = await heic2any({ blob: f, toType: 'image/jpeg', quality: 0.9 });
+  return new File([Array.isArray(out) ? out[0] : out], f.name.replace(/\.\w+$/, '.jpg'), { type: 'image/jpeg' });
+}
+const isVideo = (f: File) => f.type.startsWith('video/') || /\.(mov|mp4|m4v|webm|avi)$/i.test(f.name);
+const isPdf = (f: File) => f.type === 'application/pdf' || /\.pdf$/i.test(f.name);
+async function uploadFiles(fs: File[]) {
+  if (!fs.length) return; let f = fs[0]; const name = f.name.toLowerCase();
+  if (isVideo(f)) { creatorHelp(); return; }
+  if (/\.json$/.test(name)) { try { const j = JSON.parse(await f.text()); if (parseRoomPlanJSON(j)) importScan(f); else importJSON(f); } catch { toast('That JSON file could not be read'); } return; }
+  if (scanFormat(name) && !/\.json$/.test(name)) { importScan(f); return; }
+  if (isPdf(f)) { autoConvert(f); return; }
+  try { f = await heicFix(f); } catch (e: any) { toast('Could not read that photo: ' + e.message, 6000); return; }
+  if (fs.length > 1) { photosChoice(fs); return; }
+  try { const { blob } = await blueprintToImageBlob(f); const cv = await blobToCanvas(blob); const k = looksLikePlan(cv); if (k.plan) autoConvert(f); else photosChoice([f]); }
+  catch (e: any) { toast(e.message, 6000); }
+}
+async function photosChoice(fs: File[]) {
+  const r = await modal('What is this photo?', h('div', { class: 'menu' },
+    h('button', { class: 'mi primary', onclick: () => closeModal('yard') }, h('span', { class: 'mii' }, '🌴'), h('span', {}, h('b', {}, 'Design on this yard photo'), h('br'), h('small', {}, 'Drop in pavers, sod, mulch, curbing, palms. Hold 👁️ for before / after.'))),
+    h('button', { class: 'mi', onclick: () => closeModal('plan') }, h('span', { class: 'mii' }, '🗺️'), h('span', {}, h('b', {}, 'It is a floor plan or survey'), h('br'), h('small', {}, 'Auto-convert it to walls, doors and rooms in 3D.'))),
+    h('button', { class: 'mi', onclick: () => closeModal('lidar') }, h('span', { class: 'mii' }, '📱'), h('span', {}, h('b', {}, 'Scan with iPhone / iPad LiDAR instead'), h('br'), h('small', {}, 'Free apps give an exact-size 3D room or yard.'))),
+    h('p', { class: 'muted' }, 'Other photos or a video of a house or yard (no LiDAR)? Send them to Creator in chat — Creator turns them into a 3D model (.glb) for you to import here. It takes a few minutes.')), []);
+  if (r === 'yard') newPhotoDesign(fs[0]); if (r === 'plan') autoConvert(fs[0]); if (r === 'lidar') lidarHelp();
+}
+function creatorHelp() {
+  modal('Video → 3D model', h('div', {}, h('p', {}, h('b', {}, 'Videos are converted by Creator. '), 'Send this video to Creator in chat. Creator runs a free 3D reconstruction and sends back a ', h('b', {}, '.glb'), ' file (a few minutes).'),
+    h('p', {}, 'Then tap below and pick that .glb file. Photo/video models have no real size until you set the scale on one measured length (a door is 6\' 8").'),
+    h('p', { class: 'muted' }, 'Tips: walk slowly around the area, keep everything in view, good light, avoid mirrors and glass. iPhone/iPad Pro? A LiDAR scan is faster and already real size.'),
+    fileBtn('btn primary', '', ['🧊 Import the .glb from Creator'], fs => importScan(fs[0]))), [{ label: 'Close' }]);
+}
+function lidarHelp() {
+  modal('Scan with iPhone / iPad LiDAR', h('div', {},
+    h('p', {}, 'Works on iPhone Pro / Pro Max (12 and newer) and iPad Pro. The scan comes in at real size — no measuring.'),
+    h('ol', { class: 'help' },
+      h('li', {}, 'Install a free app: ', h('a', { href: 'https://apps.apple.com/us/app/3d-scanner-app/id1419913995', target: '_blank', rel: 'noopener' }, '3D Scanner App'), ' or ', h('a', { href: 'https://apps.apple.com/us/app/polycam-3d-scanner-modeling/id1532482376', target: '_blank', rel: 'noopener' }, 'Polycam'), '.'),
+      h('li', {}, 'Rooms: use the ', h('b', {}, 'Room / RoomPlan'), ' mode for walls, doors and windows that become editable here. Yards: use ', h('b', {}, 'LiDAR'), ' mode and walk slowly.'),
+      h('li', {}, 'Export / Share as ', h('b', {}, 'USDZ'), ' or ', h('b', {}, 'GLB'), ' (RoomPlan JSON works too) and save it to Files.'),
+      h('li', {}, 'Tap the button below and pick the file.')),
+    fileBtn('btn primary', '', ['📥 Import the scan file'], fs => importScan(fs[0]))), [{ label: 'Close' }]);
+}
+let progressEl: HTMLElement | null = null;
+function progress(title: string) { progressEl = h('p', { class: 'prog' }, 'Starting…'); modal(title, h('div', {}, h('div', { class: 'spinner' }), progressEl, h('p', { class: 'muted' }, 'Runs on this device. Free — no upload, no subscription.')), []); return (s: string) => { if (progressEl) progressEl.textContent = s; }; }
+let lastPdf: File | null = null;
+async function autoConvert(f: File, forcePage = 0) {
+  const say = progress('Converting your plan to 3D'); await new Promise(r => setTimeout(r, 30));
+  try {
+    let page = 1, pages = 1;
+    if (isPdf(f)) { lastPdf = f; if (forcePage) page = forcePage; else { say('Finding the floor plan page…'); const { pages: n, scores } = await pdfPageScores(f, lineDensity); pages = n; page = 1 + scores.indexOf(Math.max(...scores)); } }
+    say('Reading the drawing…'); const res = await blueprintToImageBlob(f, page); pages = res.pages || pages;
+    const raw = await blobToCanvas(res.blob); const { cv, deg } = deskew(raw);
+    const det = await analyze(cv, { onProgress: say });
+    const blob: Blob = deg ? await new Promise(r => cv.toBlob(b => r(b!), 'image/jpeg', 0.9)) : res.blob;
+    closeModal();
+    if (!det.walls.length) { toast('No walls found automatically. Trace it by hand: set the scale, then 📏 Draw walls.', 7000); importBlueprintBlob(blob, cv.width, cv.height, f.name); return; }
+    applyDetection(det, blob, cv.width, cv.height, f.name, { page, pages, deg });
+  } catch (e: any) { closeModal(); console.error(e); toast('Could not convert: ' + (e.message || e), 7000); }
+}
+let review: null | { det: Detection; page: number; pages: number; needScale: boolean; scaleWall: boolean } = null;
+const snapIn = (v: number) => Math.round(v / IN) * IN;
+function applyDetection(det: Detection, blob: Blob, w: number, hh: number, name: string, meta: { page: number; pages: number; deg: number }) {
+  const id = uid(); store.assets.set(id, blob); const m = det.mpp; const P2 = (q: Pt) => ({ x: snapIn(q.x * m), y: snapIn(q.y * m) });
+  store.mutate(p => {
+    p.background = { assetId: id, x: 0, y: 0, mpp: m, rot: 0, opacity: 0.45, wpx: w, hpx: hh, locked: true, visible: true, name };
+    const walls = det.walls.map(dw => { const wl: Wall = { id: uid(), a: P2(dw.a), b: P2(dw.b), thickness: Math.max(3.5 * IN, Math.min(16 * IN, Math.round(dw.t * m / (IN / 2)) * IN / 2)), height: p.defaults.wallHeight, color: '#f4f1ea' }; p.walls.push(wl); return wl; });
+    for (const o of det.openings) { const wl = walls[o.wall]; const L = wallLen(wl); const width = Math.min(L, snapIn(o.w * m)); const t = Math.min(L - width / 2, Math.max(width / 2, snapIn(o.at * m))); const win = o.kind === 'window';
+      p.openings.push({ id: uid(), kind: o.kind, style: o.style, wallId: wl.id, t, width, height: win ? p.defaults.winH : o.style === 'garage' ? 7 * FT : p.defaults.doorH, sill: win ? p.defaults.sill : 0, flip: o.flip, hingeRight: o.hingeRight }); }
+    for (const r of det.rooms) { const nm = r.name || `Room ${p.rooms.length + 1}`; const out = /lanai|patio|porch|deck|pool/i.test(nm);
+      p.rooms.push({ id: uid(), name: nm, pts: r.pts.map(P2), floor: /garage/i.test(nm) ? 'concrete' : out ? 'pavers' : /\bbed|master|\bbr\b|bdrm/i.test(nm) ? 'carpet' : /bath|\bba\b|laund|util|w\.?i\.?c/i.test(nm) ? 'graytile' : 'tile', ceilingHeight: p.defaults.ceiling, showCeiling: !out, outdoor: out }); }
+    if (!p.name || p.name === 'Untitled project') p.name = name.replace(/\.[^.]+$/, '');
+  });
+  review = { det, page: meta.page, pages: meta.pages, needScale: det.scaleFrom !== 'ocr', scaleWall: det.scaleFrom !== 'ocr' };
+  plan.review = true; fitDirty = true; setView('plan'); setTimeout(() => plan.fit(), 50); renderReviewBar();
+}
+function importBlueprintBlob(blob: Blob, w: number, hh: number, name: string) {
+  const id = uid(); store.assets.set(id, blob); const mpp = (40 * FT) / w;
+  store.mutate(p => { p.background = { assetId: id, x: 0, y: 0, mpp, rot: 0, opacity: 0.6, wpx: w, hpx: hh, locked: false, visible: true, name }; });
+  setView('plan'); plan.fit(); setTool('calibrate');
+}
+function renderReviewBar() {
+  let bar = document.getElementById('reviewbar'); if (!review) { bar?.remove(); plan.review = false; plan.redraw(); return; }
+  if (!bar) { bar = h('div', { id: 'reviewbar' }); $('#stage').append(bar); } bar.innerHTML = '';
+  const P = store.p; const nd = P.openings.filter(o => o.kind !== 'window').length, nw = P.openings.filter(o => o.kind === 'window').length; const area = P.rooms.filter(r => !r.outdoor).reduce((s, r) => s + polyArea(r.pts), 0);
+  const d = review.det; const longest = d.longestDim;
+  bar.append(h('div', { class: 'rbtxt' }, h('b', {}, `Found ${P.walls.length} walls · ${nd} doors · ${nw} windows · ${P.rooms.length} rooms${area ? ' (' + fmtArea(area) + ')' : ''}`),
+    review.needScale ? h('div', { class: 'warn' }, `⚠️ Scale not confirmed. Tap a wall and type its real length${longest ? ` (longest dimension on the plan: ${longest.text})` : ''}.`) : h('div', { class: 'ok' }, `✓ Scale ${d.scaleNote}`),
+    h('small', {}, 'Red = walls · blue = doors · green = windows. Tap a wall to fix or delete it.')),
+    h('div', { class: 'rbbtns' },
+      h('button', { class: 'btn primary', onclick: () => finishReview() }, '✓ Looks right'),
+      h('button', { class: 'btn', onclick: () => { review!.scaleWall = true; toast('Tap a wall whose length you know'); } }, '📏 Scale'),
+      review.pages > 1 && lastPdf ? h('button', { class: 'btn', onclick: async () => { const s = await prompt('Use another page', `This PDF has ${review!.pages} pages. Page number:`, String(review!.page)); const n = parseInt(s || ''); if (n) { store.undo(); review = null; renderReviewBar(); autoConvert(lastPdf!, n); } } }, `📄 Page ${review.page}/${review.pages}`) : null,
+      h('button', { class: 'btn', onclick: () => { store.undo(); review = null; renderReviewBar(); toast('Conversion removed'); } }, '↺ Undo')));
+}
+function finishReview() {
+  review = null; renderReviewBar(); store.select(null); fitDirty = true;
+  if (store.p.background) store.mutate(p => { p.background!.opacity = 0.3; });
+  if (window.innerWidth >= 900 && !split) { split = true; $('#splitBtn').classList.add('on'); }
+  setView('3d'); setTimeout(() => { plan.resize(); v3.resize(); v3.fitView(); }, 120);
+  toast('Done! Tap anything to change it. (Auto-convert is free here — other apps charge for it.)', 6000);
+}
+store.on(async w => {
+  if (w !== 'select' || !review?.scaleWall || store.sel?.kind !== 'wall') return;
+  const wl = store.wall(store.sel.id); if (!wl) return; review.scaleWall = false;
+  const L = wallLen(wl); const ld = review.det.longestDim; const s = await prompt('How long is this wall?', `It measures ${fmtLen(L)} now. Type its real length (outside to outside is fine):`, ld ? fmtLen(ld.m) : '', 'Examples: 40\' 6"  ·  40 6  ·  12.5m');
+  if (s == null) { review.scaleWall = review.needScale; return; } const v = parseLen(s); if (!v) { toast('Could not read that length'); return; }
+  rescaleAll(v / L); review.needScale = false; review.det.scaleNote = `set from a wall you typed (${fmtLen(v)})`; review.det.scaleFrom = 'ocr'; renderReviewBar(); toast('Scale set — everything resized.');
+});
+function rescaleAll(f: number) {
+  const S = (q: Pt) => ({ x: snapIn(q.x * f), y: snapIn(q.y * f) });
+  store.mutate(p => {
+    for (const w of p.walls) { w.a = S(w.a); w.b = S(w.b); w.thickness = Math.max(3.5 * IN, Math.min(16 * IN, w.thickness * f)); }
+    for (const o of p.openings) { o.t = snapIn(o.t * f); o.width = snapIn(o.width * f); }
+    for (const r of p.rooms) r.pts = r.pts.map(S); for (const o of p.objects) { o.x *= f; o.y *= f; }
+    if (p.lot) p.lot = p.lot.map(S); if (p.background) { p.background.mpp *= f; p.background.x *= f; p.background.y *= f; }
+  });
+  plan.fit();
+}
+store.on(() => { if (view === 'photo') renderPhotoEmpty(); });
+function renderPhotoEmpty() {
+  let el = document.getElementById('photoEmpty'); const show = view === 'photo' && !store.p.photos.length;
+  if (!show) { el?.remove(); return; } if (el) return;
+  el = h('div', { id: 'photoEmpty' }, h('div', { class: 'pe' }, h('div', { class: 'pei' }, '🌴'), h('h3', {}, 'Design on a photo of the yard'), h('p', { class: 'muted' }, 'Stand back, hold the phone level, include the ground and the house.'),
+    fileBtn('btn primary big', 'image/*', ['📷 Take or pick a photo'], fs => newPhotoDesign(fs[0]))));
+  $('#stage').append(el);
+}
+
+// ---------- start from address ----------
+async function startFromAddress() {
+  const inp = h('input', { class: 'inp big', value: store.p.address || '', placeholder: '123 SE 1st Ter, Cape Coral, FL', autocomplete: 'street-address' }) as HTMLInputElement;
+  const r = await modal('Start from address', h('div', {}, h('label', { class: 'lbl' }, 'Job address'), inp,
+    h('p', { class: 'muted' }, 'Free sources: lot lines from the Lee County Property Appraiser public parcel map (Lee County only), aerial from USGS (public domain, about 1 m detail), address search by OpenStreetMap. For a sharper aerial, import your own drone or Google Earth picture and line it up on two lot corners.')),
+    [{ label: 'Cancel', value: null }, { label: '📍 Find', primary: true, value: 'go' }], { onOpen: () => setTimeout(() => inp.focus(), 80) });
+  if (r !== 'go' || !inp.value.trim()) return; const q = inp.value.trim();
+  const say = progress('Finding the lot'); try {
+    say('Looking up the address…'); const g = await geocode(q); if (!g) { closeModal(); toast('Address not found. Try adding the city and FL.', 6000); return; }
+    say('Getting lot lines…'); let lot: Pt[] | null = null; let parcel = ''; let o = { lat: g.lat, lon: g.lon };
+    try { const pr = await leeParcel(g.lat, g.lon); if (pr) { const ring = pr.ring.slice(0, -1); const c = { lat: ring.reduce((s, p) => s + p[1], 0) / ring.length, lon: ring.reduce((s, p) => s + p[0], 0) / ring.length }; o = c; lot = ring.map(([lon, lat]) => toLocal(lat, lon, c.lat, c.lon)); lot = simplifyRing(lot); parcel = pr.id; } } catch (e) { console.warn(e); }
+    say('Getting the aerial…'); let ext = 60; if (lot) { const xs = lot.map(p => p.x), ys = lot.map(p => p.y); ext = Math.max(50, 1.8 * Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys))); }
+    let blob: Blob | null = null; try { blob = await usgsImage(o.lat, o.lon, ext, 1024); } catch (e) { console.warn(e); }
+    closeModal();
+    store.mutate(p => {
+      p.address = q; p.geo = { lat: o.lat, lon: o.lon, address: g.label, parcel, source: lot ? 'Lee County Property Appraiser parcels' : '' }; p.northDeg = 0;
+      if (lot) { p.lot = lot.map(q2 => ({ x: snapIn(q2.x), y: snapIn(q2.y) })); (p as any).lotFront = guessFront(p.lot!); }
+      if (blob) { const id = uid(); store.assets.set(id, blob); p.background = { assetId: id, x: -ext / 2, y: -ext / 2, mpp: ext / 1024, rot: 0, opacity: 0.85, wpx: 1024, hpx: 1024, locked: true, visible: true, name: 'USGS aerial' }; }
+    });
+    fitDirty = true; setView('plan'); plan.fit();
+    toast(lot ? `Lot found${parcel ? ' (parcel ' + parcel + ')' : ''}: ${fmtArea(lotArea(store.p.lot!))}. Now draw the house or tap 🏊 for a pool.` : 'Aerial loaded (no parcel lines here — draw the lot with Floor/area, then “Use as lot lines”).', 7000);
+  } catch (e: any) { closeModal(); toast('Could not load: ' + (e.message || e), 7000); }
+}
+function simplifyRing(L: Pt[]) { const out: Pt[] = []; for (let i = 0; i < L.length; i++) { const a = out[out.length - 1] || L[L.length - 1], b = L[i], c = L[(i + 1) % L.length]; const cr = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x); if (dist(a, b) < 0.05) continue; if (Math.abs(cr) / (dist(a, b) * dist(b, c) + 1e-9) < 0.01) continue; out.push(b); } return out.length >= 3 ? out : L; }
+function guessFront(L: Pt[]) { let best = 0, by = -Infinity; for (let i = 0; i < L.length; i++) { const a = L[i], b = L[(i + 1) % L.length]; const m = (a.y + b.y) / 2; if (m > by) { by = m; best = i; } } return best; }
+async function lotPanel() {
+  const P = store.p; const L = P.lot;
+  if (!L || L.length < 3) {
+    const r = await modal('Lot lines & setbacks', h('div', {}, h('p', {}, 'No lot lines yet.'), h('p', { class: 'muted' }, 'Get them from the address (Lee County), or draw the lot corners yourself from a survey.')), [{ label: 'Close', value: null }, { label: '✏️ Draw lot corners', value: 'draw' }, { label: '📍 From address', primary: true, value: 'addr' }]);
+    if (r === 'addr') startFromAddress(); if (r === 'draw') { lotDraw = true; setTool('room'); toast('Tap each lot corner from the survey, then tap the first corner to close.', 6000); } return;
+  }
+  const sb = setbacks(P); const list = h('div', {}, h('p', {}, `Lot area ${fmtArea(lotArea(L))}${P.geo?.parcel ? ' · parcel ' + P.geo.parcel : ''}`),
+    h('table', { class: 'tk' }, h('tr', {}, h('th', {}, 'Edge'), h('th', {}, 'Length')), ...L.map((a, i) => h('tr', {}, h('td', {}, `${i + 1}. ${edgeName(P, i)}`), h('td', {}, fmtLen(dist(a, L[(i + 1) % L.length]), { short: true }))))),
+    h('h4', {}, 'Setbacks (closest distance to each lot line)'), sb.length ? h('table', { class: 'tk' }, ...sb.map(s => h('tr', {}, h('td', {}, `${s.what} → ${edgeName(P, s.edge)} (edge ${s.edge + 1})`), h('td', {}, fmtLen(s.d, { short: true }))))) : h('p', { class: 'muted' }, 'Draw the house or add a pool to see setbacks.'),
+    h('p', { class: 'muted' }, 'Lot lines from public parcel maps are approximate. Use the survey for permits.'));
+  const r = await modal('Lot lines & setbacks', list, [{ label: 'Remove lot lines', danger: true, value: 'del' }, { label: '↻ Next edge is the front', value: 'front' }, { label: 'Done', primary: true, value: null }], { wide: true });
+  if (r === 'del') store.mutate(p => { p.lot = null; }); if (r === 'front') { store.mutate(p => { (p as any).lotFront = (((p as any).lotFront || 0) + 1) % L.length; }); lotPanel(); }
+}
+let lotDraw = false;
+store.on(w => { if (!lotDraw || w !== 'change') return; const r = store.p.rooms[store.p.rooms.length - 1]; if (!r || plan.tool === 'room') return; lotDraw = false; store.mutate(p => { p.lot = r.pts.map(q => ({ ...q })); p.rooms = p.rooms.filter(x => x.id !== r.id); (p as any).lotFront = guessFront(p.lot); }); store.select(null); toast('Lot lines set. Setbacks show in orange.'); });
+
+// ---------- pool + deck + cage + equipment pad preset ----------
+function poolPreset() {
+  const P = store.p; let x0 = 0, x1 = 40 * FT, yb = 0;
+  if (P.walls.length) { x0 = Math.min(...P.walls.flatMap(w => [w.a.x, w.b.x])); x1 = Math.max(...P.walls.flatMap(w => [w.a.x, w.b.x])); yb = Math.max(...P.walls.flatMap(w => [w.a.y, w.b.y])); }
+  const cx = (x0 + x1) / 2; const deckW = 40 * FT, deckD = 26 * FT; const top = yb + (P.walls.length ? 0 : 0);
+  const C = (k: string, x: number, y: number, rot = 0, over: Partial<Obj> = {}): Obj => { const c = CAT_BY_KEY[k]; return { id: uid(), kind: k, name: c.name, x, y, w: c.w, d: c.d, h: c.h, elev: c.elev || 0, rot, color: c.color, finish: c.finish, ...over }; };
+  store.mutate(p => {
+    p.rooms.push({ id: uid(), name: 'Pool deck', pts: [{ x: cx - deckW / 2, y: top }, { x: cx + deckW / 2, y: top }, { x: cx + deckW / 2, y: top + deckD }, { x: cx - deckW / 2, y: top + deckD }], floor: 'pavers', ceilingHeight: p.defaults.ceiling, showCeiling: false, outdoor: true });
+    p.objects.push(C('pool-rect', cx, top + deckD - 6 * FT - 7 * FT, Math.PI / 2, { name: 'Pool 14x28' }));
+    p.objects.push(C('cage', cx, top + deckD / 2, 0, { w: deckW, d: deckD, name: 'Screen cage' }));
+    p.objects.push(C('pad', cx + deckW / 2 + 4 * FT, top + 4 * FT, 0, { name: 'Pool equipment pad' }));
+  });
+  fitDirty = true; setView('plan'); plan.fit();
+  const mins = new Map<string, number>(); for (const s of setbacks(store.p)) if (/Pool|cage|Equip/.test(s.what)) mins.set(s.what, Math.min(mins.get(s.what) ?? 1e9, s.d));
+  toast(mins.size ? 'Pool added. Closest to lot line: ' + [...mins].map(([w, d]) => `${w.replace(' (water edge)', '')} ${fmtLen(d, { short: true })}`).join(' · ') + '. Drag to adjust.' : 'Pool, deck, cage and equipment pad added — drag to place. Add lot lines to check setbacks.', 7000);
+}
+
+// ---------- customer link + view-only mode ----------
+async function shareLink() {
+  const url = await shareUrl(store.p); const inp = h('input', { class: 'inp', value: url, readonly: true }) as HTMLInputElement;
+  const nav: any = navigator;
+  const r = await modal('Customer link', h('div', {}, h('p', {}, 'Your customer opens this link on any phone — no app, no login. They can turn the 3D model, walk through it, see the options and tap Approve.'), inp,
+    h('p', { class: 'muted' }, `The whole design is inside the link (${Math.round(url.length / 1024)} KB). Photos, scans and blueprints stay on your device.`)),
+    [{ label: '📋 Copy', value: 'copy' }, ...(nav.share ? [{ label: '📤 Send', primary: true, value: 'share' }] : []), { label: 'Open', value: 'open' }]);
+  if (r === 'copy') { try { await navigator.clipboard.writeText(url); toast('Link copied'); } catch { inp.select(); document.execCommand('copy'); toast('Link copied'); } }
+  if (r === 'share') { try { await nav.share({ title: store.p.name, text: `${getBiz().name}: your design for ${store.p.name}`, url }); } catch { /* cancelled */ } }
+  if (r === 'open') window.open(url, '_blank');
+}
+async function startViewer(code: string) {
+  const p: any = await decodeProject(code); store.load(migrate(p)); store.readOnly = true; document.body.classList.add('viewer');
+  const B = p.biz || getBiz(); ($('#pname') as HTMLElement).textContent = `${p.name || 'Design'} — ${B.name || 'Primus'}`;
+  const bar = h('div', { id: 'viewerbar' }, h('span', {}, 'View only · '), h('button', { class: 'btn primary', onclick: () => approveModal(p, B) }, '✅ See price & approve'));
+  $('#stage').append(bar); fitDirty = true; setView('3d'); renderTotals();
+}
+function approveModal(p: any, B: any) {
+  const t = takeoff(); const opts = options(p); let pick = opts[Math.min(1, opts.length - 1)];
+  const nameI = h('input', { class: 'inp', placeholder: 'Your name' }) as HTMLInputElement;
+  const rows = h('div', { class: 'menu' }, ...opts.map(o => { const b = h('button', { class: 'mi' + (o === pick ? ' on' : ''), onclick: () => { pick = o; rows.querySelectorAll('.mi').forEach(x => x.classList.remove('on')); b.classList.add('on'); } }, h('span', { class: 'mii' }, '◉'), h('span', {}, h('b', {}, `${o.name} — ${t.total ? money(optionPrice(o, t.total)) : 'price on request'}`), h('br'), h('small', {}, o.desc))); return b; }));
+  const msg = () => `I approve the ${pick.name} option${t.total ? ' (' + money(optionPrice(pick, t.total)) + ')' : ''} for "${p.name}"${p.address ? ' at ' + p.address : ''}. — ${nameI.value || 'Customer'}`;
+  const go = (kind: 'mail' | 'sms') => { const body = encodeURIComponent(msg()); const href = kind === 'mail' ? `mailto:${B.email || ''}?subject=${encodeURIComponent('Approved: ' + p.name)}&body=${body}` : `sms:${B.phone || ''}${/iPhone|iPad|Mac/.test(navigator.userAgent) ? '&' : '?'}body=${body}`; location.href = href; toast('Send the message to finish approving. Thank you!', 6000); };
+  modal(`${p.name || 'Your design'}`, h('div', {}, h('p', {}, `From ${B.name || 'Primus'}${B.phone ? ' · ' + B.phone : ''}`), rows, h('label', { class: 'field' }, h('span', {}, 'Your name'), nameI),
+    h('div', { class: 'row wrap' }, B.email ? h('button', { class: 'btn primary', onclick: () => go('mail') }, '✉️ Approve by email') : null, h('button', { class: B.email ? 'btn' : 'btn primary', onclick: () => go('sms') }, '💬 Approve by text')),
+    h('p', { class: 'muted' }, 'Approving sends a message to your contractor. No payment is taken here.')), [{ label: 'Close' }], { wide: true });
+}
+
+// ---------- business info, display ----------
+async function bizMenu() {
+  const B = getBiz(); const f = (k: keyof typeof B, l: string, type = 'text') => { const i = h('input', { class: 'inp', value: B[k], type }) as HTMLInputElement; i.dataset.k = k; return h('label', { class: 'field' }, h('span', {}, l), i); };
+  const body = h('div', {}, f('name', 'Company name'), f('tagline', 'Line under the name'), f('phone', 'Phone (customers approve by text)', 'tel'), f('email', 'Email (customers approve by email)', 'email'), f('license', 'License #'));
+  const r = await modal('Business info', body, [{ label: 'Cancel', value: null }, { label: 'Save', primary: true, value: 'ok' }]); if (r !== 'ok') return;
+  const nb: any = { ...B }; body.querySelectorAll('[data-k]').forEach((i: any) => nb[i.dataset.k] = i.value); setBiz(nb); toast('Saved');
+}
+function applyDisplay() { const sun = localStorage.getItem('p3d-sun') === '1'; document.body.classList.toggle('sun', sun); document.documentElement.style.setProperty('--ts', localStorage.getItem('p3d-ts') || '1'); plan.redraw(); }
+function displayMenu() {
+  const sun = localStorage.getItem('p3d-sun') === '1'; const ts = localStorage.getItem('p3d-ts') || '1';
+  modal('Display', h('div', {}, h('div', { class: 'row' }, toggle('☀️ Sunlight mode (high contrast)', sun, v => { localStorage.setItem('p3d-sun', v ? '1' : '0'); applyDisplay(); closeModal(); displayMenu(); })),
+    h('h4', {}, 'Text size'), h('div', { class: 'row wrap' }, ...[['0.9', 'Small'], ['1', 'Normal'], ['1.15', 'Large'], ['1.3', 'Extra large']].map(([v, l]) => h('button', { class: 'chip' + (ts === v ? ' on' : ''), onclick: () => { localStorage.setItem('p3d-ts', v); applyDisplay(); closeModal(); displayMenu(); } }, l)))), [{ label: 'Done', primary: true }]);
+}
+
 // ---------- boot ----------
-function afterLoad() { setUnits(store.p.units); v3.scanKey = ''; underlay = null; plan.scanUnderlay = null; photo.open(store.p.photos[store.p.photos.length - 1] || null); setView('plan'); setTimeout(() => { plan.fit(); v3.fitView(); }, 60); renderTotals(); renderTop(); }
+function afterLoad() { fitDirty = true; review = null; renderReviewBar(); setUnits(store.p.units); v3.scanKey = ''; underlay = null; plan.scanUnderlay = null; photo.open(store.p.photos[store.p.photos.length - 1] || null); setView('plan'); setTimeout(() => { plan.fit(); v3.fitView(); }, 60); renderTotals(); renderTop(); }
 async function boot() {
+  applyDisplay();
+  if (location.hash.startsWith('#v=')) { try { await startViewer(location.hash.slice(3)); return; } catch (e) { console.error(e); toast('This link is damaged or incomplete.', 6000); } }
   requestPersist();
   try { const id = await lastProjectId(); const p = id ? await loadProject(id) : null; if (p) store.load(p); } catch (e) { console.warn(e); }
   afterLoad();
   if (!store.p.walls.length && !store.p.rooms.length && !store.p.objects.length && !localStorage.getItem('p3d-welcomed')) { localStorage.setItem('p3d-welcomed', '1'); startWizard(false); }
 }
 // testing hook
-(window as any).__p3d = { store, plan, v3, photo, addRect, setView, takeoff };
+(window as any).__p3d = { store, plan, v3, photo, addRect, setView, takeoff, setbacks, shareUrl, permit: async () => shareOrDownload(await exportPermitPDF(), fileBase() + '-permit.pdf') };
 boot();
-window.addEventListener('beforeunload', () => { if (store.dirty) saveNow(); });
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden' && store.dirty) saveNow(); });
+window.addEventListener('beforeunload', () => { if (store.dirty && !store.readOnly) saveNow(); });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden' && store.dirty && !store.readOnly) saveNow(); });
+// on-screen keyboard (iPhone/iPad): keep sheets and dialogs above it, keep the focused field visible
+if (window.visualViewport) { const vv = window.visualViewport; const upd = () => { const kb = Math.max(0, window.innerHeight - vv.height - vv.offsetTop); document.documentElement.style.setProperty('--kb', kb > 80 ? kb + 'px' : '0px'); }; vv.addEventListener('resize', upd); vv.addEventListener('scroll', upd); }
+document.addEventListener('focusin', e => { const t = e.target as HTMLElement; if (t.matches?.('input,textarea')) setTimeout(() => t.scrollIntoView({ block: 'center', behavior: 'smooth' }), 300); });
 // prevent iOS page zoom/bounce on the canvas areas
 document.addEventListener('gesturestart', e => e.preventDefault());
