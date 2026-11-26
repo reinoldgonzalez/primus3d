@@ -22,3 +22,17 @@ npm install
 npm run dev
 npm run build   # GITHUB_PAGES=true for the /primus3d/ base
 ```
+
+## Photo / video → 3D pipeline (`pipeline/`)
+
+Free, open-source photogrammetry: COLMAP (camera poses) + OpenMVS (dense cloud, mesh, texture), CPU only.
+
+```bash
+# needs: colmap, ffmpeg, OpenMVS binaries, python3 with trimesh fast-simplification scipy pillow
+MVS=/path/to/OpenMVS/bin PY=python3 ./pipeline/scan.sh my_walkaround.mp4 out/      # or a folder of photos
+# options: QUALITY=fast|normal|high  FPS=2  MAX_FRAMES=90  TARGET_FACES=150000
+```
+
+Output: `out/model.glb` (leveled, centered, ≤150k faces, 2048px texture). Import it in the app with
+☰ → Import 3D scan. Photo/video scans have **no real-world size**: the app asks you to tap **Set scale**
+on a length you measured (iPhone LiDAR / RoomPlan scans are already in meters).

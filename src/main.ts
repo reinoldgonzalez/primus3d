@@ -442,9 +442,11 @@ async function importScan() {
     const THREE = await import('three'); const box = new THREE.Box3().setFromObject(obj); const size = box.getSize(new THREE.Vector3());
     const upZ = false; // most phone scan apps export Y-up; user can flip in Scan settings
     const floorY = arch ? arch.floorY : upZ ? box.min.z : box.min.y;
-    const sc: ScanRef = { assetId: id, name: f.name, format: fmt, scale: 1, x: 0, y: -floorY, z: 0, rotY: 0, visible: true, opacity: 1, cutHeight: 1.2, showInPlan: true, calibrated: true, upZ, source: arch ? arch.source : 'mesh' };
+    let photoScan = false; obj.traverse((n: any) => { if (/primus_photo_scan/i.test(n.name || '')) photoScan = true; });
+    const sc: ScanRef = { assetId: id, name: f.name, format: fmt, scale: 1, x: 0, y: -floorY, z: 0, rotY: 0, visible: true, opacity: 1, cutHeight: 1.2, showInPlan: true, calibrated: !photoScan, upZ, source: arch ? arch.source : 'mesh' };
     store.mutate(p => { p.scan = sc; });
     let msg = `Scan loaded (${fmtLen(size.x, { short: true })} × ${fmtLen(upZ ? size.y : size.z, { short: true })}). LiDAR scans are already real size.`;
+    if (photoScan) msg = 'Photo/video scan loaded. Its size is not real yet: tap “Set scale” and tap both ends of something you measured (a door is 6\' 8").';
     if (arch) { applyArch(arch); msg = `RoomPlan detected: ${arch.walls.length} walls, ${arch.openings.length} doors/windows added — all editable.`; }
     setView('3d'); setTimeout(() => v3.fitView(), 400); toast(msg, 6000);
     store.select({ kind: 'scan', id: 'scan' });
