@@ -6,8 +6,9 @@ import { PhotoView, PHOTO_MATS, PHOTO_SPRITES } from './photo';
 import { fmtLen, fmtArea, parseLen, setUnits, getUnits, fmtAngle, FT, IN } from './units';
 import { saveProject, listProjects, loadProject, deleteProject, lastProjectId, exportProjectJSON, importProjectJSON, requestPersist } from './storage';
 import { blueprintToImageBlob, scanFormat, loadScanObject, parseRoomPlanJSON, detectArchFromScene, applyArch, pdfPageScores, blobToCanvas } from './importers';
-import { analyze, deskew, lineDensity, looksLikePlan, Detection } from './autoconvert';
-import { geocode, leeParcel, leeParcelByStrap, leeStrapByAddress, aerialImage, leeBuildings, AERIALS, toLocal, setbacks, edgeName, lotArea } from './site';
+import { isPhotoOfPaper, warpQuad, Quad } from './perspective';
+import { warmOcr, analyze, cropPage, prepare, cropToDrawing, readAreaTable, footprintPx, deskew, lineDensity, looksLikePlan, Detection } from './autoconvert';
+import { geocodeExact, leeStreetLines, frontFromStreets, setbackIssues, lotFrame, leeStreet, SETBACK_DEFAULTS, leeFlood, leeParcel, leeParcelByStrap, leeStrapByAddress, aerialImage, leeBuildings, AERIALS, toLocal, setbacks, edgeName, lotArea } from './site';
 import { shareUrl, decodeProject, getBiz, setBiz } from './share';
 import { exportPNG, exportPDF, shareOrDownload, renderPlanCanvas, exportPermitPDF } from './export';
 import { exportDXF } from './dxf';
@@ -234,6 +235,7 @@ function renderProps() {
       row(txtField('Name', o.name, v => M(() => { o.name = v; }))),
       row(lenField('Width', o.w, v => M(() => { o.w = v; }), 0.01), lenField('Depth', o.d, v => M(() => { o.d = v; }), 0.005), lenField('Height', o.h, v => M(() => { o.h = v; }), 0.005)),
       row(lenField('Off the floor', o.elev, v => M(() => { o.elev = v; })), numField('Rotation', ((o.rot * 180 / Math.PI) % 360 + 360) % 360, v => M(() => { o.rot = v * Math.PI / 180; }), '°'), h('label', { class: 'field' }, h('span', {}, 'Finish'), fin)),
+      /^pool/.test(o.kind) ? poolFields(o, M) : null,
       sec('Color'), swatches(o.color, c => M(() => { o.color = c; })),
       row(h('button', { class: 'btn', onclick: () => cat && M(() => { o.w = cat.w; o.d = cat.d; o.h = cat.h; }) }, 'Reset size'), h('button', { class: 'btn', onclick: () => M(() => { o.elev = 0; }) }, 'Drop to floor'), h('button', { class: 'btn', onclick: duplicate }, 'Duplicate'), h('button', { class: 'btn danger', onclick: deleteSel }, 'Delete')));
   } else if (s.kind === 'measure') {
@@ -258,11 +260,11 @@ function renderTotals() {
 async function openTakeoff() {
   const t = takeoff(); const P = store.p; const lc = () => (P.lineCfg ||= {});
   const num = (v: number | string, set: (n: number) => void, ph = '', cls = 'inp sm') => { const i = h('input', { class: cls, inputmode: 'decimal', value: v === '' || v == null ? '' : String(v), placeholder: ph }) as HTMLInputElement; i.addEventListener('change', () => { store.mutate(() => set(parseFloat(i.value) || 0)); openTakeoff(); }); return i; };
-  const tbl = h('table', { class: 'tk' }, h('tr', {}, h('th', {}, 'Item'), h('th', {}, 'Qty'), h('th', {}, '$ / unit'), h('th', {}, 'Waste %'), h('th', {}, 'Markup %'), h('th', {}, 'Total')));
+  const tbl = h('table', { class: 'tk cards' }, h('tr', { class: 'hd' }, h('th', {}, 'Item'), h('th', {}, 'Qty'), h('th', {}, '$ / unit'), h('th', {}, 'Waste %'), h('th', {}, 'Markup %'), h('th', {}, 'Total')));
   for (const l of t.lines) {
-    tbl.append(h('tr', {}, h('td', {}, l.label, l.note ? h('div', { class: 'tnote' }, l.note) : null), h('td', { class: 'nw' }, `${l.qty} ${l.unit}`),
-      h('td', {}, num(l.price || '', v => { P.prices[l.key] = v; }, '$')), h('td', {}, num(l.waste, v => { (lc()[l.key] ||= {}).waste = v; })), h('td', {}, num(l.markup, v => { (lc()[l.key] ||= {}).markup = v; })),
-      h('td', { class: 'nw' }, l.price ? money(l.total) : '—')));
+    tbl.append(h('tr', {}, h('td', { class: 'it' }, l.label, l.note ? h('div', { class: 'tnote' }, l.note) : null), h('td', { class: 'nw', 'data-l': 'Qty' }, `${l.qty} ${l.unit}`),
+      h('td', { 'data-l': '$ / unit' }, num(l.price || '', v => { P.prices[l.key] = v; }, '$')), h('td', { 'data-l': 'Waste %' }, num(l.waste, v => { (lc()[l.key] ||= {}).waste = v; })), h('td', { 'data-l': 'Markup %' }, num(l.markup, v => { (lc()[l.key] ||= {}).markup = v; })),
+      h('td', { class: 'nw tot', 'data-l': 'Total' }, l.price ? money(l.total) : '—')));
   }
   const C = cfg(P); const setC = (k: keyof typeof C) => (v: number) => { P.tcfg = { ...(P.tcfg || {}), [k]: v }; };
   const settings = h('details', { class: 'tset' }, h('summary', {}, '⚙️ Material settings (depths, pallet size)'), h('div', { class: 'row wrap' },
@@ -325,7 +327,7 @@ async function openMenu() {
   const list = h('div', { class: 'menu' },
     I('🆕', 'New project', () => startWizard(true)), I('📂', 'My projects', () => projectsList()), I('🧬', 'Save a copy (design option B)', () => saveVariant()),
     F('⬆️', 'Upload plan or photos (auto-convert to 3D)', 'image/*,application/pdf,.pdf,video/*,.glb,.gltf,.obj,.ply,.stl,.usdz,.json,.heic', fs => uploadFiles(fs), true),
-    I('📍', 'Start from address (lot lines + aerial)', () => startFromAddress()), I('📐', 'Lot lines & setbacks', () => lotPanel()),
+    I('📍', 'Start from address (lot lines + aerial)', () => startFromAddress()), I('📐', 'Lot lines & setbacks', () => lotPanel()), I('📶', 'Make plan reading work offline (15 MB, once)', async () => { toast('Downloading the text reader…', 4000); const ok = await warmOcr(); if (ok) localStorage.setItem('p3d-ocr-warm', '1'); toast(ok ? 'Done — plan text reading now works without internet.' : 'Download failed — try again on Wi-Fi.', 5000); }),
     F('🗺️', 'Trace a blueprint / aerial by hand (no auto-convert)', 'image/*,application/pdf,.pdf,.heic', fs => importBlueprint(fs[0])),
     I('📱', 'Scan with iPhone / iPad LiDAR (free apps)', () => lidarHelp()), F('🧊', 'Import 3D scan file (GLB, OBJ, PLY, USDZ, RoomPlan)', '', fs => importScan(fs[0])),
     I('🏊', 'Add pool + deck + cage + equipment pad', () => poolPreset()), I('🧰', 'Templates', () => templatesMenu()),
@@ -628,37 +630,113 @@ function lidarHelp() {
 }
 let progressEl: HTMLElement | null = null;
 function progress(title: string) { progressEl = h('p', { class: 'prog' }, 'Starting…'); modal(title, h('div', {}, h('div', { class: 'spinner' }), progressEl, h('p', { class: 'muted' }, 'Runs on this device. Free — no upload, no subscription.')), []); return (s: string) => { if (progressEl) progressEl.textContent = s; }; }
-let lastPdf: File | null = null;
-async function autoConvert(f: File, forcePage = 0) {
-  const say = progress('Converting your plan to 3D'); await new Promise(r => setTimeout(r, 30));
+let lastPdf: File | null = null; let lastUpload: File | null = null;
+/** 4 draggable corners over the picture: crop to the plan and straighten a photo taken at an angle. */
+async function cropQuadUI(cv: HTMLCanvasElement, q0: Quad | null): Promise<Quad | null | 'whole'> {
+  const W = cv.width, H = cv.height; const box = Math.min(window.innerWidth - 60, 560), sc = Math.min(box / W, (window.innerHeight * 0.55) / H); const dw = Math.round(W * sc), dh = Math.round(H * sc);
+  const q: Quad = (q0 || [{ x: W * 0.03, y: H * 0.03 }, { x: W * 0.97, y: H * 0.03 }, { x: W * 0.97, y: H * 0.97 }, { x: W * 0.03, y: H * 0.97 }]).map(p => ({ ...p })) as Quad;
+  const img = h('img', { src: cv.toDataURL('image/jpeg', 0.8), style: `width:${dw}px;height:${dh}px;display:block` });
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg'); svg.setAttribute('width', String(dw)); svg.setAttribute('height', String(dh)); svg.setAttribute('class', 'cqsvg');
+  const poly = document.createElementNS('http://www.w3.org/2000/svg', 'polygon'); svg.append(poly);
+  const wrap = h('div', { class: 'cqwrap', style: `width:${dw}px;height:${dh}px` }, img, svg);
+  const hs = q.map((p, i) => { const d = h('div', { class: 'cqh', 'data-i': String(i) }); wrap.append(d); return d; });
+  const draw = () => { poly.setAttribute('points', q.map(p => `${p.x * sc},${p.y * sc}`).join(' ')); hs.forEach((d, i) => { d.style.left = q[i].x * sc + 'px'; d.style.top = q[i].y * sc + 'px'; }); }; draw();
+  hs.forEach((d, i) => d.addEventListener('pointerdown', e => { e.preventDefault(); d.setPointerCapture(e.pointerId); const r = wrap.getBoundingClientRect();
+    const mv = (ev: PointerEvent) => { q[i] = { x: Math.max(0, Math.min(W, (ev.clientX - r.left) / sc)), y: Math.max(0, Math.min(H, (ev.clientY - r.top) / sc)) }; draw(); };
+    const up = () => { d.removeEventListener('pointermove', mv); d.removeEventListener('pointerup', up); }; d.addEventListener('pointermove', mv); d.addEventListener('pointerup', up); }));
+  const r = await modal('Crop & straighten', h('div', {}, h('p', { class: 'muted' }, 'Drag the 4 orange corners onto the corners of the floor plan (leave out titles, notes and tables). A photo taken at an angle gets straightened.'), wrap),
+    [{ label: 'Use whole picture', value: 'whole' }, { label: '✓ Use this area', primary: true, value: 'ok' }], { wide: true });
+  return r === 'ok' ? q : r === 'whole' ? 'whole' : null;
+}
+async function autoConvert(f: File, forcePage = 0, forceCrop = false) {
+  lastUpload = f; const say = progress('Converting your plan to 3D'); await new Promise(r => setTimeout(r, 30));
   try {
     let page = 1, pages = 1;
     if (isPdf(f)) { lastPdf = f; if (forcePage) page = forcePage; else { say('Finding the floor plan page…'); const { pages: n, scores } = await pdfPageScores(f, lineDensity); pages = n; page = 1 + scores.indexOf(Math.max(...scores)); } }
     say('Reading the drawing…'); const res = await blueprintToImageBlob(f, page); pages = res.pages || pages;
-    const raw = await blobToCanvas(res.blob); const { cv, deg } = deskew(raw);
-    const det = await analyze(cv, { onProgress: say });
-    const blob: Blob = deg ? await new Promise(r => cv.toBlob(b => r(b!), 'image/jpeg', 0.9)) : res.blob;
+    let raw0 = await blobToCanvas(res.blob);
+    const paper = isPdf(f) ? null : isPhotoOfPaper(raw0);
+    if (paper || forceCrop) { closeModal(); const qq = await cropQuadUI(raw0, paper); if (!qq) return; if (qq !== 'whole') raw0 = warpQuad(raw0, qq); progress('Converting your plan to 3D'); }
+    say('Cleaning up the picture…'); await new Promise(r => setTimeout(r, 0));
+    const pg = cropPage(raw0); const pre = prepare(pg.cv); const cr = cropToDrawing(pre.cv, 2400, pg.notes.length > 0); const notes = [...pg.notes, ...pre.notes, ...cr.notes];
+    const { cv, deg } = deskew(cr.cv);
+    const det = await analyze(cv, { onProgress: say }); (det as any).notes = notes;
+    if (det.scaleFrom === 'guess' && det.walls.length) { // read the BUILDING AREA table and size the house from it
+      try { say('Reading the area table…'); const T = await readAreaTable(pre.cv, cr.box, say); (det as any).areaTable = T; const target = T ? (T.ac && T.garage ? T.ac + T.garage : T.underRoof ? T.underRoof - (T.lanai || 0) - (T.entry || 0) : 0) : 0; const px = footprintPx(det);
+        if (T && target > 300 && px > 0) { const m = Math.sqrt(target * FT * FT / px); if (m / det.mpp > 0.5 && m / det.mpp < 2) { det.mpp = m; det.scaleFrom = 'area'; det.scaleNote = `from the plan's area table (${T.text} sq ft) — please check one wall`; } } } catch (e) { console.warn(e); }
+    }
+    const blob: Blob = cv !== raw0 ? await new Promise(r => cv.toBlob(b => r(b!), 'image/jpeg', 0.9)) : res.blob;
     closeModal();
     if (!det.walls.length) { toast('No walls found automatically. Trace it by hand: set the scale, then 📏 Draw walls.', 7000); importBlueprintBlob(blob, cv.width, cv.height, f.name); return; }
     applyDetection(det, blob, cv.width, cv.height, f.name, { page, pages, deg });
   } catch (e: any) { closeModal(); console.error(e); toast('Could not convert: ' + (e.message || e), 7000); }
 }
-let review: null | { det: Detection; page: number; pages: number; needScale: boolean; scaleWall: boolean } = null;
+let review: null | { keepBg: any; ids: { walls: Set<string>; rooms: Set<string>; objects: Set<string> }; det: Detection; page: number; pages: number; needScale: boolean; scaleWall: boolean } = null;
 const snapIn = (v: number) => Math.round(v / IN) * IN;
 function applyDetection(det: Detection, blob: Blob, w: number, hh: number, name: string, meta: { page: number; pages: number; deg: number }) {
   const id = uid(); store.assets.set(id, blob); const m = det.mpp; const P2 = (q: Pt) => ({ x: snapIn(q.x * m), y: snapIn(q.y * m) });
+  const keepBg = store.p.lot && store.p.background && store.p.geo ? { ...store.p.background } : null; const ids = { walls: new Set<string>(), rooms: new Set<string>(), objects: new Set<string>() };
+  const nW0 = store.p.walls.length, nR0 = store.p.rooms.length;
   store.mutate(p => {
     p.background = { assetId: id, x: 0, y: 0, mpp: m, rot: 0, opacity: 0.45, wpx: w, hpx: hh, locked: true, visible: true, name };
-    const walls = det.walls.map(dw => { const wl: Wall = { id: uid(), a: P2(dw.a), b: P2(dw.b), thickness: Math.max(3.5 * IN, Math.min(16 * IN, Math.round(dw.t * m / (IN / 2)) * IN / 2)), height: p.defaults.wallHeight, color: '#f4f1ea' }; p.walls.push(wl); return wl; });
+    const wallH = det.ceiling || p.defaults.wallHeight; const walls = det.walls.map(dw => { const wl: Wall = { id: uid(), a: P2(dw.a), b: P2(dw.b), thickness: Math.max(3.5 * IN, Math.min(16 * IN, Math.round(dw.t * m / (IN / 2)) * IN / 2)), height: wallH, color: '#f4f1ea' }; p.walls.push(wl); return wl; });
     for (const o of det.openings) { const wl = walls[o.wall]; const L = wallLen(wl); const width = Math.min(L, snapIn(o.w * m)); const t = Math.min(L - width / 2, Math.max(width / 2, snapIn(o.at * m))); const win = o.kind === 'window';
       p.openings.push({ id: uid(), kind: o.kind, style: o.style, wallId: wl.id, t, width, height: win ? p.defaults.winH : o.style === 'garage' ? 7 * FT : p.defaults.doorH, sill: win ? p.defaults.sill : 0, flip: o.flip, hingeRight: o.hingeRight }); }
     for (const r of det.rooms) { const nm = r.name || `Room ${p.rooms.length + 1}`; const out = /lanai|patio|porch|deck|pool/i.test(nm);
-      p.rooms.push({ id: uid(), name: nm, pts: r.pts.map(P2), floor: /garage/i.test(nm) ? 'concrete' : out ? 'pavers' : /\bbed|master|\bbr\b|bdrm/i.test(nm) ? 'carpet' : /bath|\bba\b|laund|util|w\.?i\.?c/i.test(nm) ? 'graytile' : 'tile', ceilingHeight: p.defaults.ceiling, showCeiling: !out, outdoor: out }); }
+      p.rooms.push({ id: uid(), name: nm, pts: r.pts.map(P2), floor: /garage/i.test(nm) ? 'concrete' : out ? 'pavers' : /\bbed|master|\bbr\b|bdrm/i.test(nm) ? 'carpet' : /bath|\bba\b|laund|util|w\.?i\.?c/i.test(nm) ? 'graytile' : 'tile', ceilingHeight: det.ceiling || p.defaults.ceiling, showCeiling: !out, outdoor: out }); }
     if (!p.name || p.name === 'Untitled project') p.name = name.replace(/\.[^.]+$/, '');
+    // wide openings: on the garage = garage (roll-up) door; other exterior walls = sliding glass door; inside = cased opening
+    const garages = p.rooms.slice(nR0).filter(r => /garage/i.test(r.name));
+    const nearGarage = (w: Wall) => garages.some(r => { const xs = r.pts.map(q => q.x), ys = r.pts.map(q => q.y); const mx = (w.a.x + w.b.x) / 2, my = (w.a.y + w.b.y) / 2, e = 0.6; return mx > Math.min(...xs) - e && mx < Math.max(...xs) + e && my > Math.min(...ys) - e && my < Math.max(...ys) + e; });
+    for (const o of p.openings) { const wi = walls.findIndex(w => w.id === o.wallId); if (wi < 0 || o.kind !== 'door' || o.width < 6.6 * FT) continue; const ext = !!(det.walls[wi] as any)?.ext; const w = walls[wi];
+      if (o.width >= 7.5 * FT && (nearGarage(w) || (ext && !garages.length && o.width >= 14 * FT))) { o.style = 'garage'; o.height = 7 * FT; }
+      else if (ext) { o.kind = 'slider'; o.style = 'slider'; o.height = Math.max(p.defaults.doorH, 80 * IN); }
+      else { o.kind = 'opening'; o.style = 'opening'; } }
+    p.walls.slice(nW0).forEach(w => ids.walls.add(w.id)); p.rooms.slice(nR0).forEach(r => ids.rooms.add(r.id));
   });
-  review = { det, page: meta.page, pages: meta.pages, needScale: det.scaleFrom !== 'ocr', scaleWall: det.scaleFrom !== 'ocr' };
+  review = { keepBg, ids, det, page: meta.page, pages: meta.pages, needScale: det.scaleFrom === 'guess', scaleWall: det.scaleFrom !== 'ocr' };
   plan.review = true; fitDirty = true; setView('plan'); setTimeout(() => plan.fit(), 50); renderReviewBar();
 }
+// ---------- place an uploaded plan on the lot ----------
+function setPts(ids: { walls: Set<string>; rooms: Set<string>; objects: Set<string> }, p: Project) { const out: Pt[] = []; for (const w of p.walls) if (ids.walls.has(w.id)) out.push(w.a, w.b); for (const r of p.rooms) if (ids.rooms.has(r.id)) out.push(...r.pts); for (const o of p.objects) if (ids.objects.has(o.id)) out.push(...objCornersM(o)); return out; }
+function objCornersM(o: Obj): Pt[] { const c = Math.cos(o.rot), s2 = Math.sin(o.rot); return [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([a, b]) => ({ x: o.x + (a * o.w / 2) * c - (b * o.d / 2) * s2, y: o.y + (a * o.w / 2) * s2 + (b * o.d / 2) * c })); }
+function rotateSet(ids: { walls: Set<string>; rooms: Set<string>; objects: Set<string> }, th: number, c?: Pt) {
+  store.mutate(p => { const pts = setPts(ids, p); if (!pts.length) return; const xs = pts.map(q => q.x), ys = pts.map(q => q.y); const cc = c || { x: (Math.min(...xs) + Math.max(...xs)) / 2, y: (Math.min(...ys) + Math.max(...ys)) / 2 };
+    const C = Math.cos(th), S = Math.sin(th); const rt = (q: Pt) => { const x = q.x - cc.x, y = q.y - cc.y; q.x = cc.x + C * x - S * y; q.y = cc.y + S * x + C * y; };
+    for (const w of p.walls) if (ids.walls.has(w.id)) { rt(w.a); rt(w.b); } for (const r of p.rooms) if (ids.rooms.has(r.id)) r.pts.forEach(rt); for (const o of p.objects) if (ids.objects.has(o.id)) { rt(o); o.rot += th; } });
+}
+function moveSet(ids: { walls: Set<string>; rooms: Set<string>; objects: Set<string> }, dx: number, dy: number) {
+  store.mutate(p => { const mv = (q: Pt) => { q.x += dx; q.y += dy; }; for (const w of p.walls) if (ids.walls.has(w.id)) { mv(w.a); mv(w.b); } for (const r of p.rooms) if (ids.rooms.has(r.id)) r.pts.forEach(mv); for (const o of p.objects) if (ids.objects.has(o.id)) mv(o); });
+}
+/** Lot frame coordinates of a point: t along the street, d = depth from the front line. */
+function lf(q: Pt) { const F = lotFrame(store.p); const x = q.x - F.m.x, y = q.y - F.m.y; return { t: x * F.u.x + y * F.u.y, d: x * F.v.x + y * F.v.y }; }
+function fromLf(t: number, d: number) { const F = lotFrame(store.p); return { x: F.m.x + F.u.x * t + F.v.x * d, y: F.m.y + F.u.y * t + F.v.y * d }; }
+function extentLf(pts: Pt[]) { const a = pts.map(lf); return { t0: Math.min(...a.map(q => q.t)), t1: Math.max(...a.map(q => q.t)), d0: Math.min(...a.map(q => q.d)), d1: Math.max(...a.map(q => q.d)) }; }
+async function startPlace(ids: { walls: Set<string>; rooms: Set<string>; objects: Set<string> }) {
+  const P = store.p; const old = P.rooms.find(r => /^Existing house/.test(r.name) && !ids.rooms.has(r.id)); let anchor: Pt | null = null;
+  if (old) {
+    const r = await modal('Existing house on this lot', h('p', {}, 'The county records show a house here. Is your plan a new house that replaces it, or an addition/remodel?'), [{ label: 'Keep it (addition)', value: 'keep' }, { label: 'Replace it', primary: true, value: 'rep' }]);
+    if (r === 'rep') { const xs = old.pts.map(q => q.x), ys = old.pts.map(q => q.y); const e = 0.5, x0 = Math.min(...xs) - e, x1 = Math.max(...xs) + e, y0 = Math.min(...ys) - e, y1 = Math.max(...ys) + e; const inB = (q: Pt) => q.x > x0 && q.x < x1 && q.y > y0 && q.y < y1;
+      anchor = { x: (x0 + x1) / 2, y: (y0 + y1) / 2 };
+      store.mutate(p => { const gone = new Set(p.walls.filter(w => !ids.walls.has(w.id) && inB(w.a) && inB(w.b)).map(w => w.id)); p.walls = p.walls.filter(w => !gone.has(w.id)); p.openings = p.openings.filter(o => !gone.has(o.wallId)); p.rooms = p.rooms.filter(x => x.id !== old.id); }); }
+  }
+  // the bottom of the drawing is usually the front of the house: turn it to face the street
+  const F = lotFrame(store.p); rotateSet(ids, Math.atan2(-F.out.x, F.out.y));
+  const pts = setPts(ids, store.p); const S = { ...SETBACK_DEFAULTS, ...(store.p.setbacks || {}) };
+  if (anchor) { const xs = pts.map(q => q.x), ys = pts.map(q => q.y); moveSet(ids, anchor.x - (Math.min(...xs) + Math.max(...xs)) / 2, anchor.y - (Math.min(...ys) + Math.max(...ys)) / 2); }
+  else { const E = extentLf(pts), Lx = extentLf(store.p.lot!); const tc = (Lx.t0 + Lx.t1) / 2 - (E.t0 + E.t1) / 2, dd = S.front + 1 * FT - E.d0; const tgt = fromLf(tc, dd), o = fromLf(0, 0); moveSet(ids, tgt.x - o.x, tgt.y - o.y); }
+  plan.place = ids; setTool('select'); setView('plan'); fitDirty = true; setTimeout(() => plan.fit(), 60); renderPlaceBar();
+}
+function renderPlaceBar() {
+  let bar = document.getElementById('placebar'); const ids = plan.place; if (!ids) { bar?.remove(); return; }
+  if (!bar) { bar = h('div', { id: 'placebar' }); $('#stage').append(bar); } bar.innerHTML = '';
+  const iss = setbackIssues(store.p);
+  bar.append(h('div', { class: 'pbt' }, h('b', {}, '📍 Place the plan on the lot'), h('div', {}, 'Drag with one finger to move it. Turn it with the buttons. Pinch to zoom.'),
+    iss.length ? h('div', { class: 'warn' }, '⚠️ ' + iss.slice(0, 3).join(' · ')) : h('div', { class: 'ok' }, '✓ Inside the lot and the setbacks')),
+    h('div', { class: 'row' }, h('button', { class: 'btn', onclick: () => rotateSet(ids, -Math.PI / 2) }, '↺ 90°'), h('button', { class: 'btn', onclick: () => rotateSet(ids, -Math.PI / 180) }, '↺ 1°'), h('button', { class: 'btn', onclick: () => rotateSet(ids, Math.PI / 180) }, '↻ 1°'), h('button', { class: 'btn', onclick: () => rotateSet(ids, Math.PI / 2) }, '↻ 90°'),
+      h('button', { class: 'btn primary', onclick: () => { plan.place = null; renderPlaceBar(); const n = setbackIssues(store.p); toast(n.length ? '⚠️ Placed, but check: ' + n.join(' · ') : 'Placed. Everything is inside the setbacks.', 7000); if (window.innerWidth >= 900 && !split) { split = true; $('#splitBtn').classList.add('on'); } setView('3d'); setTimeout(() => { plan.resize(); v3.resize(); v3.fitView(); }, 120); } }, '✓ Done')));
+}
+store.on(w => { if (plan.place && (w === 'change' || w === 'live')) { const b = document.getElementById('placebar'); if (b) { const t = b.querySelector('.pbt > div:last-child'); const iss = setbackIssues(store.p); if (t) { t.className = iss.length ? 'warn' : 'ok'; t.textContent = iss.length ? '⚠️ ' + iss.slice(0, 3).join(' · ') : '✓ Inside the lot and the setbacks'; } } } });
 function importBlueprintBlob(blob: Blob, w: number, hh: number, name: string) {
   const id = uid(); store.assets.set(id, blob); const mpp = (40 * FT) / w;
   store.mutate(p => { p.background = { assetId: id, x: 0, y: 0, mpp, rot: 0, opacity: 0.6, wpx: w, hpx: hh, locked: false, visible: true, name }; });
@@ -669,17 +747,24 @@ function renderReviewBar() {
   if (!bar) { bar = h('div', { id: 'reviewbar' }); $('#stage').append(bar); } bar.innerHTML = '';
   const P = store.p; const nd = P.openings.filter(o => o.kind !== 'window').length, nw = P.openings.filter(o => o.kind === 'window').length; const area = P.rooms.filter(r => !r.outdoor).reduce((s, r) => s + polyArea(r.pts), 0);
   const d = review.det; const longest = d.longestDim;
-  bar.append(h('div', { class: 'rbtxt' }, h('b', {}, `Found ${P.walls.length} walls · ${nd} doors · ${nw} windows · ${P.rooms.length} rooms${area ? ' (' + fmtArea(area) + ')' : ''}`),
-    review.needScale ? h('div', { class: 'warn' }, `⚠️ Scale not confirmed. Tap a wall and type its real length${longest ? ` (longest dimension on the plan: ${longest.text})` : ''}.`) : h('div', { class: 'ok' }, `✓ Scale ${d.scaleNote}`),
+  if (!bar.dataset.init) { bar.dataset.init = '1'; if (window.innerWidth < 560) bar.classList.add('mini'); }
+  bar.append(h('div', { class: 'rbtxt' }, h('b', { onclick: () => bar!.classList.toggle('mini') }, `Found ${P.walls.length} walls · ${nd} doors · ${nw} windows · ${P.rooms.length} rooms${area ? ' (' + fmtArea(area) + ')' : ''}`),
+    review.needScale ? h('div', { class: 'warn' }, `⚠️ Scale not confirmed (${d.scaleNote.replace(/ — please.*$/, '')}). Tap a wall and type its real length${longest && d.dims.length >= 2 && longest.m < 25 ? ` (longest dimension read: ${longest.text})` : ' — e.g. the overall width written on the plan'}.`) : h('div', { class: 'ok' }, `✓ Scale ${d.scaleNote}`),
+    (d as any).areaTable ? h('small', {}, `Plan's area table: ${(d as any).areaTable.text} sq ft · closed-in area of the walls now: ${Math.round(footprintPx(d) * d.mpp * d.mpp / (FT * FT)).toLocaleString()} sq ft`) : null,
+    d.walls.length > 120 ? h('div', { class: 'warn' }, `⚠️ ${d.walls.length} wall pieces — this drawing is busy (scan, hatching or notes). Tip: screenshot only the floor plan and upload that, or tap Undo and trace it: 📏 set the scale, then Draw walls over it.`) : null,
+    d.elevations ? h('div', { class: 'warn' }, '⚠️ This page has elevation drawings (side views). Only floor-plan lines become walls — for best results upload the floor plan page by itself.') : null,
+    d.ceiling ? h('small', {}, `Walls set to ${fmtLen(d.ceiling, { short: true })} (ceiling height read from the plan)`) : null,
     h('small', {}, 'Red = walls · blue = doors · green = windows. Tap a wall to fix or delete it.')),
     h('div', { class: 'rbbtns' },
       h('button', { class: 'btn primary', onclick: () => finishReview() }, '✓ Looks right'),
       h('button', { class: 'btn', onclick: () => { review!.scaleWall = true; toast('Tap a wall whose length you know'); } }, '📏 Scale'),
+      lastUpload ? h('button', { class: 'btn', onclick: () => { const f = lastUpload!; store.undo(); review = null; renderReviewBar(); autoConvert(f, 0, true); } }, '✂️ Crop') : null,
       review.pages > 1 && lastPdf ? h('button', { class: 'btn', onclick: async () => { const s = await prompt('Use another page', `This PDF has ${review!.pages} pages. Page number:`, String(review!.page)); const n = parseInt(s || ''); if (n) { store.undo(); review = null; renderReviewBar(); autoConvert(lastPdf!, n); } } }, `📄 Page ${review.page}/${review.pages}`) : null,
       h('button', { class: 'btn', onclick: () => { store.undo(); review = null; renderReviewBar(); toast('Conversion removed'); } }, '↺ Undo')));
 }
 function finishReview() {
-  review = null; renderReviewBar(); store.select(null); fitDirty = true;
+  const rv = review; review = null; renderReviewBar(); store.select(null); fitDirty = true;
+  if (rv?.keepBg && store.p.lot) { store.mutate(p => { p.background = rv.keepBg; }); startPlace(rv.ids); return; }
   if (store.p.background) store.mutate(p => { p.background!.opacity = 0.3; });
   if (window.innerWidth >= 900 && !split) { split = true; $('#splitBtn').classList.add('on'); }
   setView('3d'); setTimeout(() => { plan.resize(); v3.resize(); v3.fitView(); }, 120);
@@ -719,9 +804,11 @@ async function startFromAddress() {
     [{ label: 'Cancel', value: null }, { label: '📍 Go', primary: true, value: 'go' }], { onOpen: () => setTimeout(() => inp.focus(), 80) });
   if (r !== 'go' || !inp.value.trim()) return; const q = inp.value.trim();
   const say = progress('Finding the lot'); try {
-    say('Looking up the address…'); const g = await geocode(q); if (!g) { closeModal(); toast('Address not found. Try adding the city and FL.', 6000); return; }
+    say('Looking up the address…'); const g = await geocodeExact(q); if (!g) { closeModal(); toast('Address not found. Try adding the city and FL.', 6000); return; }
     say('Getting lot lines…'); let lot: Pt[] | null = null; let parcel = ''; let o = { lat: g.lat, lon: g.lon };
     try { const strap = await leeStrapByAddress(q).catch(() => null); const pr = (strap && await leeParcelByStrap(strap).catch(() => null)) || await leeParcel(g.lat, g.lon); if (pr) { const ring = pr.ring.slice(0, -1); const la = ring.map(p => p[1]), lo = ring.map(p => p[0]); const c = { lat: (Math.min(...la) + Math.max(...la)) / 2, lon: (Math.min(...lo) + Math.max(...lo)) / 2 }; o = c; lot = ring.map(([lon, lat]) => toLocal(lat, lon, c.lat, c.lon)); lot = simplifyRing(lot); parcel = pr.id; } } catch (e) { console.warn(e); }
+    let streets: { name: string; pts: Pt[] }[] = []; try { streets = (await leeStreetLines(o.lat, o.lon, '')).map(s2 => ({ name: s2.name, pts: s2.pts.map(([lon, lat]) => toLocal(lat, lon, o.lat, o.lon)) })); } catch (e) { console.warn(e); }
+    const flood = await leeFlood(o.lat, o.lon).catch(() => null);
     say('Finding the existing house…'); let bld: { pts: Pt[]; info: any }[] = [];
     try { bld = (await leeBuildings(parcel, g.lat, g.lon)).map(b => ({ pts: simplifyRing(b.ring.slice(0, -1).map(([lon, lat]) => toLocal(lat, lon, o.lat, o.lon))), info: b.info })).filter(b => b.pts.length >= 3); } catch (e) { console.warn(e); }
     say('Getting the sharp aerial…'); let ext = 60; if (lot) { const xs = lot.map(p => p.x), ys = lot.map(p => p.y); ext = Math.max(45, 1.5 * Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys)), 2 * Math.max(...xs.map(Math.abs), ...ys.map(Math.abs)) + 10); }
@@ -729,20 +816,20 @@ async function startFromAddress() {
     closeModal();
     const T = 8 * IN;
     store.mutate(p => {
-      p.address = q; if (/^Untitled/.test(p.name)) p.name = q.split(',')[0]; p.geo = { lat: o.lat, lon: o.lon, address: g.label, parcel, source: [lot ? 'Lot: Lee County Property Appraiser parcels' : '', bld.length ? 'House: Lee County GIS building footprints' : '', air ? 'Aerial: ' + air.src.label.replace(/ \(.*/, '') : ''].filter(Boolean).join(' · ') } as any; p.northDeg = 0;
-      if (lot) { p.lot = lot.map(q2 => ({ x: snapIn(q2.x), y: snapIn(q2.y) })); (p as any).lotFront = guessFront(p.lot!); }
+      p.address = q; if (/^Untitled/.test(p.name)) p.name = q.split(',')[0]; p.geo = { lat: o.lat, lon: o.lon, address: g.label, parcel, source: [lot ? 'Lot: Lee County Property Appraiser parcels' : '', bld.length ? 'House: Lee County GIS building footprints' : '', air ? 'Aerial: ' + air.src.label.replace(/ \(.*/, '') : '', 'Address: ' + g.how].filter(Boolean).join(' · ') } as any; p.northDeg = 0; if (flood) (p as any).flood = { ...((p as any).flood || {}), ...flood };
+      if (lot) { p.lot = lot.map(q2 => ({ x: snapIn(q2.x), y: snapIn(q2.y) })); const fs = frontFromStreets(p.lot!, streets, leeStreet(q).replace(/^\d+ /, '')); (p as any).lotFront = fs >= 0 ? fs : guessFront(p.lot!); (p as any).frontFrom = fs >= 0 ? 'street' : 'guess'; }
       if (air) { const id = uid(); store.assets.set(id, air.blob); p.background = { assetId: id, x: -ext / 2, y: -ext / 2, mpp: ext / air.px, rot: 0, opacity: 0.9, wpx: air.px, hpx: air.px, locked: true, visible: true, name: air.src.label }; (p as any).aerialExt = ext; }
       for (const b of bld) { // existing building → editable walls on the footprint (outside face), plus a floor
         let pts = b.pts.map(q2 => ({ x: snapIn(q2.x), y: snapIn(q2.y) })); if (polySignedArea(pts) < 0) pts = pts.reverse();
         const cl = insetPoly(pts, T / 2); const stories = Math.max(1, +b.info?.MaxStories || 1);
         const ids: string[] = []; for (let i = 0; i < cl.length; i++) { const a = cl[i], c = cl[(i + 1) % cl.length]; if (dist(a, c) < 0.2) continue; const w: Wall = { id: uid(), a: { ...a }, b: { ...c }, thickness: T, height: p.defaults.wallHeight * stories, color: '#f4f1ea' }; p.walls.push(w); ids.push(w.id); }
         const desc = [b.info?.BldgDescription, b.info?.ActualYearBuilt ? 'built ' + b.info.ActualYearBuilt : '', b.info?.ActualArea ? b.info.ActualArea.toLocaleString() + ' sq ft total' : ''].filter(Boolean).join(', ');
-        p.rooms.push({ id: uid(), name: 'Existing house' + (desc ? ' (' + desc + ')' : ''), pts: insetPoly(pts, T), floor: 'tile', ceilingHeight: p.defaults.wallHeight, showCeiling: false });
+        (p as any).existingInfo = desc; p.rooms.push({ id: uid(), name: 'Existing house' + (b.info?.ActualYearBuilt ? ` (${b.info.ActualYearBuilt})` : ''), pts: insetPoly(pts, T), floor: 'tile', ceilingHeight: p.defaults.wallHeight, showCeiling: false });
       }
     });
     fitDirty = true; setView('plan'); plan.fit();
-    const L = store.p.lot; const dims = L ? L.map((a, i) => fmtLen(dist(a, L[(i + 1) % L.length]), { short: true })).slice(0, 4).join(' × ') : '';
-    toast(lot ? `Lot ${fmtArea(lotArea(L!))}${dims ? ' (' + dims + ')' : ''}${bld.length ? ' · existing house added as walls' : ''}${air ? ' · aerial: ' + air.src.label : ''}. Setbacks show in orange.` : 'Aerial loaded (no parcel lines here — draw the lot with Floor/area, then “Use as lot lines”).', 9000);
+    const L = store.p.lot; const eds = L ? L.map((a, i) => dist(a, L[(i + 1) % L.length])).filter(d => d >= 3) : []; const dims = eds.length && eds.length <= 4 ? eds.map(d => fmtLen(d, { short: true })).join(' × ') : eds.length ? `${eds.length} sides` : '';
+    toast((g.exact ? '' : /not in Lee/.test(g.how) ? '⚠️ That house number is not in Lee County records — the lot shown is the nearest match. Check the address. ' : '⚠️ Only the street was found, not the house number — check the lot is right. ') + (lot ? `Lot ${fmtArea(lotArea(L!))}${dims ? ' (' + dims + ')' : ''}${bld.length ? ' · existing house added as walls' + ((store.p as any).existingInfo ? ' (' + (store.p as any).existingInfo + ')' : '') : ''}${air ? ' · aerial: ' + air.src.label : ''}. Setbacks show in orange.` : 'Aerial loaded (no parcel lines here — draw the lot with Floor/area, then “Use as lot lines”).'), 9000);
   } catch (e: any) { closeModal(); toast('Could not load: ' + (e.message || e), 7000); }
 }
 function polySignedArea(P: Pt[]) { let s = 0; for (let i = 0; i < P.length; i++) { const a = P[i], b = P[(i + 1) % P.length]; s += a.x * b.y - b.x * a.y; } return s / 2; }
@@ -758,27 +845,36 @@ async function changeAerial(id: string) {
   catch (e: any) { closeModal(); toast(e.message, 5000); }
 }
 function simplifyRing(L: Pt[]) { const out: Pt[] = []; for (let i = 0; i < L.length; i++) { const a = out[out.length - 1] || L[L.length - 1], b = L[i], c = L[(i + 1) % L.length]; const cr = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x); if (dist(a, b) < 0.05) continue; if (Math.abs(cr) / (dist(a, b) * dist(b, c) + 1e-9) < 0.01) continue; out.push(b); } return out.length >= 3 ? out : L; }
-function guessFront(L: Pt[]) { let best = 0, by = -Infinity; for (let i = 0; i < L.length; i++) { const a = L[i], b = L[(i + 1) % L.length]; const m = (a.y + b.y) / 2; if (m > by) { by = m; best = i; } } return best; }
+function guessFront(L: Pt[]) { let best = 0, by = -Infinity; for (let i = 0; i < L.length; i++) { const a = L[i], b = L[(i + 1) % L.length]; if (dist(a, b) < 3) continue; const m = (a.y + b.y) / 2; if (m > by) { by = m; best = i; } } return best; }
 async function lotPanel() {
   const P = store.p; const L = P.lot;
   if (!L || L.length < 3) {
     const r = await modal('Lot lines & setbacks', h('div', {}, h('p', {}, 'No lot lines yet.'), h('p', { class: 'muted' }, 'Get them from the address (Lee County), or draw the lot corners yourself from a survey.')), [{ label: 'Close', value: null }, { label: '✏️ Draw lot corners', value: 'draw' }, { label: '📍 From address', primary: true, value: 'addr' }]);
     if (r === 'addr') startFromAddress(); if (r === 'draw') { lotDraw = true; setTool('room'); toast('Tap each lot corner from the survey, then tap the first corner to close.', 6000); } return;
   }
-  const sb = setbacks(P); const list = h('div', {}, h('p', {}, `Lot area ${fmtArea(lotArea(L))}${P.geo?.parcel ? ' · parcel ' + P.geo.parcel : ''}`),
-    h('table', { class: 'tk' }, h('tr', {}, h('th', {}, 'Edge'), h('th', {}, 'Length')), ...L.map((a, i) => h('tr', {}, h('td', {}, `${i + 1}. ${edgeName(P, i)}`), h('td', {}, fmtLen(dist(a, L[(i + 1) % L.length]), { short: true }))))),
-    h('h4', {}, 'Setbacks (closest distance to each lot line)'), sb.length ? h('table', { class: 'tk' }, ...sb.map(s => h('tr', {}, h('td', {}, `${s.what} → ${edgeName(P, s.edge)} (edge ${s.edge + 1})`), h('td', {}, fmtLen(s.d, { short: true }))))) : h('p', { class: 'muted' }, 'Draw the house or add a pool to see setbacks.'),
+  const sb = setbacks(P); const S = { ...SETBACK_DEFAULTS, ...(P.setbacks || {}) }; const iss = setbackIssues(P); const fr = (P as any).lotFront ?? 0;
+  const setF = (i: number) => { store.mutate(p => { (p as any).lotFront = i; (p as any).frontFrom = 'user'; }); closeModal(); lotPanel(); };
+  const num = (k: keyof typeof S, l: string) => { const i = h('input', { class: 'inp sm', type: 'number', step: '0.5', inputmode: 'decimal', value: String(Math.round(S[k] / FT * 10) / 10), onchange: () => { const v = parseFloat(i.value); if (v >= 0) store.mutate(p => { p.setbacks = { ...SETBACK_DEFAULTS, ...(p.setbacks || {}), [k]: v * FT }; }); } }) as HTMLInputElement; return h('label', { class: 'field sbf' }, h('span', {}, l), i); };
+  const list = h('div', {}, h('p', {}, `Lot area ${fmtArea(lotArea(L))}${P.geo?.parcel ? ' · parcel ' + P.geo.parcel : ''}`),
+    h('p', { class: 'muted' }, (P as any).frontFrom === 'street' ? 'Front = the lot line on the street of the address. Wrong? Tap “Street side” on the right line.' : 'Which side faces the street? Tap “Street side” on that line.'),
+    h('table', { class: 'tk' }, h('tr', {}, h('th', {}, 'Lot line'), h('th', {}, 'Length'), h('th', {}, '')), ...L.map((a, i) => { const len = dist(a, L[(i + 1) % L.length]); if (len < 3) return null; return h('tr', {}, h('td', {}, `${i + 1}. ${edgeName(P, i)}`), h('td', {}, fmtLen(len, { short: true })), h('td', {}, i === fr ? '✓ street' : h('button', { class: 'chip', onclick: () => setF(i) }, 'Street side'))); })),
+    iss.length ? h('div', { class: 'warnbox' }, h('b', {}, '⚠️ Check these:'), ...iss.map(t => h('div', {}, '• ' + t))) : null,
+    h('h4', {}, 'Setbacks (closest distance to each lot line)'), sb.length ? h('table', { class: 'tk' }, ...sb.map(s2 => h('tr', { class: s2.bad ? 'bad' : '' }, h('td', {}, `${s2.what} → ${edgeName(P, s2.edge)}`), h('td', {}, (s2.bad ? '⚠️ ' : '✓ ') + fmtLen(Math.max(0, s2.d), { short: true }) + (s2.need ? ` (min ${fmtLen(s2.need, { short: true })})` : ''))))) : h('p', { class: 'muted' }, 'Draw the house or add a pool to see setbacks.'),
+    h('h4', {}, 'Flood'), h('div', { class: 'row wrap' }, ...(['zone', 'bfe', 'ffe'] as const).map(k => { const F = (P as any).flood || {}; const i = h('input', { class: 'inp sm', value: F[k] ?? '', placeholder: k === 'zone' ? 'AE' : 'ft NAVD', onchange: () => store.mutate(p => { (p as any).flood = { ...((p as any).flood || {}), [k]: k === 'zone' ? i.value.toUpperCase() : (i.value === '' ? null : +i.value) }; }) }) as HTMLInputElement; return h('label', { class: 'field sbf' }, h('span', {}, k === 'zone' ? 'Flood zone' : k === 'bfe' ? 'BFE (ft)' : 'Finish floor FFE (ft)'), i); })),
+    h('h4', {}, 'Minimum setbacks (ft)'), h('div', { class: 'row wrap' }, num('front', 'Front'), num('side', 'Side'), num('rear', 'Rear'), num('pool', 'Pool/cage rear')),
+    h('p', { class: 'muted' }, 'Defaults are typical Cape Coral single-family (R-1). Waterfront, corner and other zones differ — check the zoning for this lot.'),
     P.geo ? h('div', {}, h('h4', {}, 'Aerial picture'), h('div', { class: 'row' }, ...AERIALS.map(a => h('button', { class: 'chip' + (P.background?.name === a.label ? ' on' : ''), onclick: () => { closeModal(); changeAerial(a.id); } }, a.label))),
       h('p', { class: 'muted' }, 'FDOT = Florida DOT statewide photos (public record, about 3–6 in detail, a few years old). NAIP = USDA/USGS (public domain, newer but about 2 ft detail).')) : null,
     h('p', { class: 'muted' }, (P.geo as any)?.source ? 'Sources: ' + (P.geo as any).source + '. ' : '', 'Lot lines from public parcel maps are approximate. Use the survey for permits.'));
-  const r = await modal('Lot lines & setbacks', list, [{ label: 'Remove lot lines', danger: true, value: 'del' }, { label: '↻ Next edge is the front', value: 'front' }, { label: 'Done', primary: true, value: null }], { wide: true });
-  if (r === 'del') store.mutate(p => { p.lot = null; }); if (r === 'front') { store.mutate(p => { (p as any).lotFront = (((p as any).lotFront || 0) + 1) % L.length; }); lotPanel(); }
+  const r = await modal('Lot lines & setbacks', list, [{ label: 'Remove lot lines', danger: true, value: 'del' }, { label: 'Done', primary: true, value: null }], { wide: true });
+  if (r === 'del') store.mutate(p => { p.lot = null; });
 }
 let lotDraw = false;
 store.on(w => { if (!lotDraw || w !== 'change') return; const r = store.p.rooms[store.p.rooms.length - 1]; if (!r || plan.tool === 'room') return; lotDraw = false; store.mutate(p => { p.lot = r.pts.map(q => ({ ...q })); p.rooms = p.rooms.filter(x => x.id !== r.id); (p as any).lotFront = guessFront(p.lot); }); store.select(null); toast('Lot lines set. Setbacks show in orange.'); });
 
 // ---------- pool + deck + cage + equipment pad preset ----------
 function poolPreset() {
+  if (store.p.lot && store.p.lot.length > 2) return poolOnLot();
   const P = store.p; let x0 = 0, x1 = 40 * FT, yb = 0;
   if (P.walls.length) { x0 = Math.min(...P.walls.flatMap(w => [w.a.x, w.b.x])); x1 = Math.max(...P.walls.flatMap(w => [w.a.x, w.b.x])); yb = Math.max(...P.walls.flatMap(w => [w.a.y, w.b.y])); }
   const cx = (x0 + x1) / 2; const deckW = 40 * FT, deckD = 26 * FT; const top = yb + (P.walls.length ? 0 : 0);
@@ -794,8 +890,40 @@ function poolPreset() {
   toast(mins.size ? 'Pool added. Closest to lot line: ' + [...mins].map(([w, d]) => `${w.replace(' (water edge)', '')} ${fmtLen(d, { short: true })}`).join(' · ') + '. Drag to adjust.' : 'Pool, deck, cage and equipment pad added — drag to place. Add lot lines to check setbacks.', 7000);
 }
 
+/** On a lot: deck + pool + cage behind the house (the side away from the street), pad beside the deck. */
+function poolOnLot() {
+  const P = store.p; const S = { ...SETBACK_DEFAULTS, ...(P.setbacks || {}) }; const F = lotFrame(P); const ang = Math.atan2(F.u.y, F.u.x);
+  const house = P.walls.flatMap(w => [w.a, w.b]).concat(P.rooms.filter(r => !r.outdoor).flatMap(r => r.pts)); const Lx = extentLf(P.lot!);
+  const E = house.length ? extentLf(house) : { t0: (Lx.t0 + Lx.t1) / 2 - 20 * FT, t1: (Lx.t0 + Lx.t1) / 2 + 20 * FT, d0: S.front, d1: S.front + 45 * FT };
+  const deckW = 40 * FT; let deckD = 26 * FT; const room = Lx.d1 - S.pool - E.d1; if (room < deckD && room > 16 * FT) deckD = Math.floor(room / FT) * FT;
+  const tc = Math.max(Lx.t0 + S.side + deckW / 2, Math.min(Lx.t1 - S.side - deckW / 2, (E.t0 + E.t1) / 2)); const d0 = E.d1;
+  const C = (k: string, q: Pt, rot = 0, over: Partial<Obj> = {}): Obj => { const c = CAT_BY_KEY[k]; return { id: uid(), kind: k, name: c.name, x: q.x, y: q.y, w: c.w, d: c.d, h: c.h, elev: c.elev || 0, rot, color: c.color, finish: c.finish, ...over }; };
+  store.mutate(p => {
+    p.rooms.push({ id: uid(), name: 'Pool deck', pts: [fromLf(tc - deckW / 2, d0), fromLf(tc + deckW / 2, d0), fromLf(tc + deckW / 2, d0 + deckD), fromLf(tc - deckW / 2, d0 + deckD)], floor: 'pavers', ceilingHeight: p.defaults.ceiling, showCeiling: false, outdoor: true });
+    p.objects.push(C('pool-rect', fromLf(tc, d0 + deckD - 6 * FT - 7 * FT), ang + Math.PI / 2, { name: 'Pool 14x28' }));
+    p.objects.push(C('cage', fromLf(tc, d0 + deckD / 2), ang, { w: deckW, d: deckD, name: 'Screen cage' }));
+    const padSide = tc + deckW / 2 + 4 * FT + 3 * FT < Lx.t1 ? 1 : -1; p.objects.push(C('pad', fromLf(tc + padSide * (deckW / 2 + 4 * FT), d0 + 4 * FT), ang, { name: 'Pool equipment pad' }));
+  });
+  fitDirty = true; setView('plan'); plan.fit();
+  const iss = setbackIssues(store.p); toast(iss.length ? '⚠️ Pool added behind the house, but check: ' + iss.join(' · ') + '. Drag to adjust.' : `Pool added behind the house (${fmtLen(deckD, { short: true })} deck). Inside all setbacks. Drag to adjust.`, 8000);
+}
+
+/** Pool details: shape, depths, steps, spa → gallons and excavation (also in the takeoff). */
+function poolFields(o: Obj, M: (fn: () => void) => void) {
+  const q: any = o; const sh = q.shape || (o.kind === 'pool-rect' ? 'rect' : 'free'); const d1 = q.depth1 ?? 3.5 * FT, d2 = q.depth2 ?? 6 * FT;
+  const st = poolStats(o);
+  return h('div', {}, sec('Pool details'),
+    h('div', { class: 'row wrap' }, ...[['rect', 'Rectangle'], ['free', 'Freeform'], ['L', 'L-shape'], ['kidney', 'Kidney']].map(([k, l]) => h('button', { class: 'chip' + (sh === k ? ' on' : ''), onclick: () => M(() => { q.shape = k; }) }, l))),
+    row(lenField('Shallow end', d1, v => M(() => { q.depth1 = v; }), 0.05), lenField('Deep end', d2, v => M(() => { q.depth2 = v; }), 0.05), numField('Steps', q.steps ?? 1, v => M(() => { q.steps = Math.max(0, Math.round(v)); }), 'sets')),
+    row(toggle('Attached spa', !!q.spa, v => M(() => { q.spa = v; }))),
+    h('p', { class: 'muted' }, `About ${Math.round(st.gal).toLocaleString()} gallons · water area ${Math.round(st.sf)} sq ft · dig ≈ ${st.cy.toFixed(1)} cu yd (1 ft over-dig around and below)`));
+}
+export function poolStats(o: Obj) { const q: any = o; const k = q.shape === 'free' || (!q.shape && o.kind !== 'pool-rect') ? 0.85 : q.shape === 'kidney' ? 0.8 : q.shape === 'L' ? 0.75 : 1; const L = o.w / FT, W = o.d / FT; const avg = ((q.depth1 ?? 3.5 * FT) + (q.depth2 ?? 6 * FT)) / 2 / FT; const sf = L * W * k; return { sf, gal: sf * avg * 7.48 + (q.spa ? 600 : 0), cy: ((L + 2) * (W + 2) * k * (avg + 1)) / 27 + (q.spa ? 3 : 0) }; }
+
 // ---------- customer link + view-only mode ----------
 async function shareLink() {
+  const B0 = getBiz(); if (!B0.phone && !B0.email) { toast('Add your business phone or email first — that is where the customer\'s approval goes.', 6000); await bizMenu(); const B1 = getBiz(); if (!B1.phone && !B1.email) return; }
+  if (!takeoff().total) { const r0 = await modal('Prices are $0', h('p', {}, 'No unit prices are set, so the customer will see “price on request”. Send anyway?'), [{ label: '$ Set prices', value: 'prices' }, { label: 'Send anyway', primary: true, value: 'go' }]); if (r0 === 'prices') { openTakeoff(); return; } if (r0 !== 'go') return; }
   const url = await shareUrl(store.p); const inp = h('input', { class: 'inp', value: url, readonly: true }) as HTMLInputElement;
   const nav: any = navigator;
   const r = await modal('Customer link', h('div', {}, h('p', {}, 'Your customer opens this link on any phone — no app, no login. They can turn the 3D model, walk through it, see the options and tap Approve.'), inp,
@@ -814,12 +942,13 @@ async function startViewer(code: string) {
 function approveModal(p: any, B: any) {
   const t = takeoff(); const opts = options(p); let pick = opts[Math.min(1, opts.length - 1)];
   const nameI = h('input', { class: 'inp', placeholder: 'Your name' }) as HTMLInputElement;
-  const rows = h('div', { class: 'menu' }, ...opts.map(o => { const b = h('button', { class: 'mi' + (o === pick ? ' on' : ''), onclick: () => { pick = o; rows.querySelectorAll('.mi').forEach(x => x.classList.remove('on')); b.classList.add('on'); } }, h('span', { class: 'mii' }, '◉'), h('span', {}, h('b', {}, `${o.name} — ${t.total ? money(optionPrice(o, t.total)) : 'price on request'}`), h('br'), h('small', {}, o.desc))); return b; }));
-  const msg = () => `I approve the ${pick.name} option${t.total ? ' (' + money(optionPrice(pick, t.total)) + ')' : ''} for "${p.name}"${p.address ? ' at ' + p.address : ''}. — ${nameI.value || 'Customer'}`;
-  const go = (kind: 'mail' | 'sms') => { const body = encodeURIComponent(msg()); const href = kind === 'mail' ? `mailto:${B.email || ''}?subject=${encodeURIComponent('Approved: ' + p.name)}&body=${body}` : `sms:${B.phone || ''}${/iPhone|iPad|Mac/.test(navigator.userAgent) ? '&' : '?'}body=${body}`; location.href = href; toast('Send the message to finish approving. Thank you!', 6000); };
-  modal(`${p.name || 'Your design'}`, h('div', {}, h('p', {}, `From ${B.name || 'Primus'}${B.phone ? ' · ' + B.phone : ''}`), rows, h('label', { class: 'field' }, h('span', {}, 'Your name'), nameI),
+  const rows = h('div', { class: 'menu' }, ...opts.map(o => { const b = h('button', { class: 'mi' + (o === pick ? ' on' : ''), onclick: () => { pick = o; rows.querySelectorAll('.mi').forEach(x => { x.classList.remove('on'); const r = x.querySelector('.mii'); if (r) r.textContent = '○'; }); b.classList.add('on'); b.querySelector('.mii')!.textContent = '●'; } }, h('span', { class: 'mii' }, o === pick ? '●' : '○'), h('span', {}, h('b', {}, `${o.name} — ${t.total ? money(optionPrice(o, t.total)) : 'price on request'}`), h('br'), h('small', {}, o.desc))); return b; }));
+  const agree = h('input', { type: 'checkbox' }) as HTMLInputElement;
+  const msg = () => `I approve the ${pick.name} option${t.total ? ' (' + money(optionPrice(pick, t.total)) + ')' : ''} for "${p.name}"${p.address ? ' at ' + p.address : ''}.\nSigned: ${nameI.value.trim()} — ${new Date().toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' })}`;
+  const go = (kind: 'mail' | 'sms') => { if (nameI.value.trim().length < 3) { toast('Type your full name to sign'); nameI.focus(); return; } if (!agree.checked) { toast('Tick “I approve” to sign'); return; } const body = encodeURIComponent(msg()); const href = kind === 'mail' ? `mailto:${B.email || ''}?subject=${encodeURIComponent('Approved: ' + p.name)}&body=${body}` : `sms:${B.phone || ''}${/iPhone|iPad|Mac/.test(navigator.userAgent) ? '&' : '?'}body=${body}`; location.href = href; toast('Send the message to finish approving. Thank you!', 6000); };
+  modal(`${p.name || 'Your design'}`, h('div', {}, h('p', {}, `From ${B.name || 'Primus'}${B.phone ? ' · ' + B.phone : ''}`), rows, h('label', { class: 'field' }, h('span', {}, 'Type your full name to sign'), nameI), h('label', { class: 'row agree' }, agree, h('span', {}, ' I approve this design and price. My typed name is my signature.')),
     h('div', { class: 'row wrap' }, B.email ? h('button', { class: 'btn primary', onclick: () => go('mail') }, '✉️ Approve by email') : null, h('button', { class: B.email ? 'btn' : 'btn primary', onclick: () => go('sms') }, '💬 Approve by text')),
-    h('p', { class: 'muted' }, 'Approving sends a message to your contractor. No payment is taken here.')), [{ label: 'Close' }], { wide: true });
+    h('p', { class: 'muted' }, 'Approving opens a text or email to your contractor with your choice, typed name and the date and time — you press Send. Nothing is stored on a server and no payment is taken here.')), [{ label: 'Close' }], { wide: true });
 }
 
 // ---------- business info, display ----------
@@ -842,12 +971,13 @@ async function boot() {
   applyDisplay();
   if (location.hash.startsWith('#v=')) { try { await startViewer(location.hash.slice(3)); return; } catch (e) { console.error(e); toast('This link is damaged or incomplete.', 6000); } }
   requestPersist();
+  { const c: any = (navigator as any).connection; if (!localStorage.getItem('p3d-ocr-warm') && c && !c.saveData && (c.type === 'wifi' || c.type === 'ethernet')) setTimeout(() => warmOcr().then(ok => ok && localStorage.setItem('p3d-ocr-warm', '1')), 20000); }
   try { const id = await lastProjectId(); const p = id ? await loadProject(id) : null; if (p) store.load(p); } catch (e) { console.warn(e); }
   afterLoad();
   if (!store.p.walls.length && !store.p.rooms.length && !store.p.objects.length && !localStorage.getItem('p3d-welcomed')) { localStorage.setItem('p3d-welcomed', '1'); startWizard(false); }
 }
 // testing hook
-(window as any).__p3d = { store, plan, v3, photo, addRect, setView, takeoff, setbacks, shareUrl, permit: async () => shareOrDownload(await exportPermitPDF(), fileBase() + '-permit.pdf') };
+(window as any).__p3d = { review: () => review, upload: uploadFiles, poolPreset, setbackIssues, store, plan, v3, photo, addRect, setView, takeoff, setbacks, shareUrl, permit: async () => shareOrDownload(await exportPermitPDF(), fileBase() + '-permit.pdf') };
 boot();
 window.addEventListener('beforeunload', () => { if (store.dirty && !store.readOnly) saveNow(); });
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden' && store.dirty && !store.readOnly) saveNow(); });

@@ -38,10 +38,14 @@ export function takeoff(P: Project = store.p) {
     if (mat === 'pool') { add('area:pool', 'Pool surface area', A, 'sq ft'); imperviousSf += A; return; }
     add('area:' + mat, label, A, 'sq ft', '', DEFAULT_WASTE[mat] || 0); imperviousSf += A;
   };
+  // pool, spa and equipment pad sit IN the deck: the deck is bought for what is left
+  const inPoly = (p: { x: number; y: number }, L: { x: number; y: number }[]) => { let c = false; for (let i = 0, j = L.length - 1; i < L.length; j = i++) { const a = L[i], b = L[j]; if ((a.y > p.y) !== (b.y > p.y) && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x) c = !c; } return c; };
+  const cutters = P.objects.filter(o => /^(pool|spa|pad$|slab$)/.test(o.kind));
+  let wallFoot = 0; for (const w of P.walls) wallFoot += wallLen(w) * w.thickness / SQFT;
   for (const r of P.rooms) {
-    const ol = roomOutline(r); const A = polyArea(ol) / SQFT; const per = polyPerimeter(ol) / FT; const mat = FLOORS[r.floor]?.label || r.floor;
+    const ol = roomOutline(r); let A = polyArea(ol) / SQFT; if (r.outdoor) for (const o of cutters) if (inPoly(o, ol)) A = Math.max(0, A - (o.w * o.d) / SQFT); const per = polyPerimeter(ol) / FT; const mat = FLOORS[r.floor]?.label || r.floor;
     if (r.outdoor) { outdoorSf += A; hardscape(r.floor, A, per, `${mat} (outdoor)`); }
-    else { floorSf += A; imperviousSf += A; add('floor:' + r.floor, `${mat} flooring`, A, 'sq ft', '', DEFAULT_WASTE[r.floor] || 0); }
+    else { floorSf += A; add('floor:' + r.floor, `${mat} flooring`, A, 'sq ft', '', DEFAULT_WASTE[r.floor] || 0); }
     if (r.curb) { curbLf += per; add('curb', 'Concrete curbing', per, 'lf'); }
   }
   for (const o of P.openings) { const it = OPENINGS.find(x => x.style === (o.style || '') && x.kind === o.kind); const nm = (it?.name.replace(/\s*\d.*$/, '') || o.kind) + ` ${Math.round(o.width / IN)}"x${Math.round(o.height / IN)}"`; add('op:' + nm, nm, 1, 'ea'); }
@@ -55,8 +59,13 @@ export function takeoff(P: Project = store.p) {
     else if (o.kind === 'cage') { add('cage-lf', 'Screen cage perimeter', per, 'lf'); add('cage-sf', 'Screen cage area (walls + roof)', (per * FT * o.h + o.w * o.d) / SQFT, 'sq ft'); imperviousSf += 0; }
     else if (it && it.shape === 'slab' && o.h < 0.15) { add('obj:' + o.kind, o.name, A, 'sq ft'); imperviousSf += A; }
     else if (it && ['fence', 'fenceRail', 'hedge'].includes(it.shape) || o.kind === 'hedge' || o.kind === 'seawall') add('obj:' + o.kind, o.name.replace(/\s*\d+'.*$/, ''), o.w / FT, 'lf');
-    else { add('obj:' + o.name, o.name, 1, 'ea'); if (o.kind.startsWith('pool')) imperviousSf += A; }
+    else { add('obj:' + o.name, o.name, 1, 'ea'); if (/^(pool|spa)/.test(o.kind)) imperviousSf += A;
+      if (/^pool/.test(o.kind)) { const q: any = o; const k = q.shape === 'free' || (!q.shape && o.kind !== 'pool-rect') ? 0.85 : q.shape === 'kidney' ? 0.8 : q.shape === 'L' ? 0.75 : 1; const Lf = o.w / FT, Wf = o.d / FT; const avg = ((q.depth1 ?? 3.5 * FT) + (q.depth2 ?? 6 * FT)) / 2 / FT; const sf = Lf * Wf * k;
+        const ex = add('poolexc', 'Pool excavation (1 ft over-dig)', ((Lf + 2) * (Wf + 2) * k * (avg + 1)) / 27 + (q.spa ? 3 : 0), 'cu yd'); if (ex) ex.note = `≈ ${Math.round(sf * avg * 7.48 + (q.spa ? 600 : 0)).toLocaleString()} gallons`;
+        add('poolint', 'Pool interior finish (floor + walls)', sf + 2 * (Lf + Wf) * k * avg, 'sq ft'); add('poolcoping', 'Pool coping', 2 * (Lf + Wf) * Math.sqrt(k), 'lf'); if (q.steps) add('poolsteps', 'Pool step sets', q.steps, 'ea'); if (q.spa) add('spa', 'Attached spa', 1, 'ea'); } }
   }
+  // building footprint = rooms + the walls themselves (outside face); with no rooms drawn, the area inside the walls
+  let foot = floorSf + wallFoot; if (!floorSf && P.walls.length) foot = wallFoot; imperviousSf += foot;
   // sod is bought by the pallet
   const sod = lines.find(l => l.key === 'sod'); if (sod) { const pallets = Math.ceil(sod.qty * (1 + sod.waste / 100) / C.palletSf); sod.note = `${Math.round(sod.qty)} sq ft + ${sod.waste}% waste ÷ ${C.palletSf} sq ft/pallet`; sod.key = 'sod'; sod.label = 'Sod pallets'; sod.unit = 'pallets'; sod.qty = pallets; sod.waste = 0; }
   for (const l of lines) {
@@ -65,7 +74,7 @@ export function takeoff(P: Project = store.p) {
     l.total = l.qty * (1 + l.waste / 100) * l.price * (1 + l.markup / 100);
   }
   const total = lines.reduce((s, l) => s + l.total, 0);
-  return { lines, total, wallLf, floorSf, outdoorSf, curbLf, imperviousSf };
+  return { lines, total, wallLf, floorSf, outdoorSf, curbLf, imperviousSf, footprintSf: foot };
 }
 export function options(P: Project = store.p) { return (P.options && P.options.length ? P.options : DEFAULT_OPTIONS); }
 export function optionPrice(o: { factor: number; price?: number | null }, base: number) { return o.price != null && o.price > 0 ? o.price : base * (o.factor || 1); }

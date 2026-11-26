@@ -29,6 +29,8 @@ export class PlanView {
   snap = true; showDims = true;
   /** auto-convert review: colour walls/doors/windows */
   review = false;
+  /** 'Place on lot': one-finger drag moves this set of walls/rooms/objects together */
+  place: null | { walls: Set<string>; rooms: Set<string>; objects: Set<string> } = null;
   /** Apple Pencil palm rejection: while the pen is down (and shortly after), ignore touches */
   private penUntil = 0;
   wallStart: Pt | null = null; cursor: Pt | null = null; chainCount = 0;
@@ -147,6 +149,7 @@ export class PlanView {
     if (this.pointers.size > 2) return;
     const p = this.toWorld(s.x, s.y);
     if (e.button === 1 || e.button === 2 || this.tool === 'pan') { this.drag = { kind: 'pan', start: p, last: p, moved: false, screen: s }; return; }
+    if (this.tool === 'select' && this.place) { this.drag = { kind: 'place', start: p, last: p, moved: false, screen: s }; return; }
     if (this.tool === 'select') {
       const h = this.hit(p);
       if (h) {
@@ -239,6 +242,8 @@ export class PlanView {
         else { const dx = p.x - d.last.x, dy = p.y - d.last.y; m.a = { ...m.a, x: m.a.x + dx, z: m.a.z + dy }; m.b = { ...m.b, x: m.b.x + dx, z: m.b.z + dy }; }
         break;
       }
+      case 'place': { const dx = p.x - d.last.x, dy = p.y - d.last.y; const S = this.place!; const mv = (q: Pt) => { q.x += dx; q.y += dy; };
+        for (const w of P.walls) if (S.walls.has(w.id)) { mv(w.a); mv(w.b); } for (const r of P.rooms) if (S.rooms.has(r.id)) r.pts.forEach(mv); for (const o of P.objects) if (S.objects.has(o.id)) mv(o); break; }
       case 'background': { const bg = P.background!; bg.x += p.x - d.last.x; bg.y += p.y - d.last.y; break; }
     }
     d.last = p; store.emit('live');
@@ -541,7 +546,7 @@ export function drawPlan(c: CanvasRenderingContext2D, P: Project, v: ViewXf, W: 
       const s = toS({ x: m.x + nx * 16 / v.scale, y: m.y + ny * 16 / v.scale }); let ang = Math.atan2(dy, dx); if (ang > Math.PI / 2) ang -= Math.PI; if (ang < -Math.PI / 2) ang += Math.PI;
       label(c, s.x, s.y, fmtLen(L, { short: v.scale < 25 }), r.outdoor ? '#2b8a3e' : '#1864ab', 10, ang, 'rgba(255,255,255,0.6)'); }
   }
-  for (const ob of P.objects) { if (Math.min(ob.w, ob.d) * v.scale < 40) continue; const s = toS(ob); label(c, s.x, s.y, ob.name, '#333', 10, 0, ''); }
+  for (const ob of P.objects) { if (Math.min(ob.w, ob.d) * v.scale < 40) continue; const big = ob.kind === 'cage' || ob.kind === 'pergola'; const off = big ? ob.d / 2 - 0.6 : 0; const s = toS({ x: ob.x + Math.sin(ob.rot) * off, y: ob.y - Math.cos(ob.rot) * off }); label(c, s.x, s.y, ob.name, '#333', 10, 0, big ? 'rgba(255,255,255,0.7)' : ''); }
   for (const m of P.measures) { const s = toS({ x: (m.a.x + m.b.x) / 2, y: (m.a.z + m.b.z) / 2 }); const L = Math.hypot(m.b.x - m.a.x, m.b.y - m.a.y, m.b.z - m.a.z); label(c, s.x, s.y - 12, fmtLen(L), '#7048e8', 11); }
 }
 

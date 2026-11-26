@@ -34,7 +34,12 @@ export async function pdfPageScores(file: File, score: (cv: HTMLCanvasElement) =
   for (let i = 1; i <= Math.min(doc.numPages, maxPages); i++) {
     const pg = await doc.getPage(i); const vp0 = pg.getViewport({ scale: 1 }); const vp = pg.getViewport({ scale: 900 / Math.max(vp0.width, vp0.height) });
     const cv = document.createElement('canvas'); cv.width = Math.floor(vp.width); cv.height = Math.floor(vp.height); const c = cv.getContext('2d')!; c.fillStyle = '#fff'; c.fillRect(0, 0, cv.width, cv.height);
-    await pg.render({ canvasContext: c, viewport: vp, canvas: cv }).promise; scores.push(score(cv));
+    await pg.render({ canvasContext: c, viewport: vp, canvas: cv }).promise; let sc = score(cv);
+    // page titles from the PDF text layer: prefer floor plans, avoid elevations/sections/site/roof/electrical sheets
+    try { const tc = await pg.getTextContent(); const t = tc.items.map((it: any) => it.str).join(' ').toUpperCase();
+      const fp = (t.match(/(FLOOR|FIRST|MAIN|GROUND|SECOND|LEVEL \d) ?(FLOOR )?PLAN/g) || []).length, bad = (t.match(/ELEVATION|SECTION|SITE PLAN|ROOF (FRAMING )?PLAN|ELECTRICAL|PLUMBING|DETAIL|TRUSS|SURVEY|STRUCTURAL/g) || []).length;
+      sc *= fp ? 1.6 : bad ? 0.5 : 1; } catch { /* scanned PDF: no text layer */ }
+    scores.push(sc);
   }
   return { pages: doc.numPages, scores };
 }

@@ -12,7 +12,7 @@ export interface DRoom { pts: { x: number; y: number }[]; name: string }
 export interface DDim { text: string; m: number; x0: number; y0: number; x1: number; y1: number; px?: number }
 export interface Detection {
   w: number; h: number; walls: DWall[]; openings: DOpening[]; rooms: DRoom[];
-  mpp: number; scaleFrom: 'ocr' | 'guess'; scaleNote: string; dims: DDim[]; longestDim: DDim | null; ocrOk: boolean; words: OcrWord[]; ms: number;
+  mpp: number; scaleFrom: 'ocr' | 'guess' | 'area'; ceiling?: number | null; elevations?: number; scaleNote: string; dims: DDim[]; longestDim: DDim | null; ocrOk: boolean; words: OcrWord[]; ms: number;
 }
 export interface OcrWord { text: string; x0: number; y0: number; x1: number; y1: number; line: number; conf: number }
 type Seg = { o: 'h' | 'v'; c: number; a: number; b: number; t: number; src: 'thick' | 'pair' | 'thin'; glazed?: [number, number][] };
@@ -55,8 +55,49 @@ export function lineDensity(cv: HTMLCanvasElement): number {
 }
 
 /** Clean the sheet before reading it: invert blueprints (light lines on dark), flatten yellowed paper, shadows and uneven light. */
+/** Screenshots: the paper is pure white, app bars and thumbnail strips are grey/dark. Keep the largest run of white-paper rows/columns. */
+export function cropPage(src: HTMLCanvasElement): { cv: HTMLCanvasElement; notes: string[] } {
+  const W = src.width, H = src.height; const d = src.getContext('2d', { willReadFrequently: true })!.getImageData(0, 0, W, H).data;
+  const wr = new Float32Array(H), wc = new Float32Array(W);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { const i = (y * W + x) * 4; if (d[i] > 243 && d[i + 1] > 243 && d[i + 2] > 243) { wr[y]++; wc[x]++; } }
+  const run = (a: Float32Array, n: number, other: number) => { let best = [0, n], bl = 0, s0 = -1, gap = 0; const tol = Math.max(2, n * 0.015);
+    for (let i = 0; i <= n; i++) { const ok = i < n && a[i] / other > 0.45; if (ok) { if (s0 < 0) s0 = i; gap = 0; } else if (s0 >= 0) { gap++; if (gap > tol || i === n) { const e = i - gap + 1; if (e - s0 > bl) { bl = e - s0; best = [s0, e]; } s0 = -1; gap = 0; } } }
+    return best; };
+  const [y0, y1] = run(wr, H, W); const [x0, x1] = run(wc, W, H); const notes: string[] = [];
+  if ((y1 - y0) * (x1 - x0) > 0.92 * W * H || (y1 - y0) < H * 0.2 || (x1 - x0) < W * 0.3) return { cv: src, notes };
+  // only when what is cut off really is app chrome (grey/dark bars), not part of a drawing
+  let cw = 0, cn = 0; for (let y = 0; y < H; y++) if (y < y0 || y >= y1) { cw += wr[y] / W; cn++; } for (let x = 0; x < W; x++) if (x < x0 || x >= x1) { cw += wc[x] / H; cn++; }
+  if (!cn || cw / cn > 0.3) return { cv: src, notes };
+  const out = document.createElement('canvas'); out.width = x1 - x0; out.height = y1 - y0; out.getContext('2d')!.drawImage(src, x0, y0, out.width, out.height, 0, 0, out.width, out.height);
+  notes.push('screen/app borders removed'); return { cv: out, notes };
+}
+/** Phone screenshots and full sheets: keep only the drawing (drops app toolbars, thumbnails, title blocks, notes, tables).
+ *  Finds the biggest cluster of line work; photos/thumbnails (solid dark areas) count little. */
+export function cropToDrawing(src: HTMLCanvasElement, maxSide = 2400, screenshot = false): { cv: HTMLCanvasElement; box: { x: number; y: number; w: number; h: number } | null; notes: string[] } {
+  const W = src.width, H = src.height; const g = grayOf(src); const k = Math.max(1, Math.ceil(Math.max(W, H) / 500)); const w = Math.ceil(W / k), h = Math.ceil(H / k);
+  const ink = new Uint8Array(w * h), cnt = new Uint16Array(w * h);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) if (g[y * W + x] < 150) { const j = ((y / k) | 0) * w + ((x / k) | 0); ink[j] = 1; cnt[j]++; }
+  const r = Math.max(2, Math.round(Math.max(w, h) * 0.007)); const dl = new Uint8Array(w * h), tmp = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) { let last = -1e9; for (let x = 0; x < w; x++) { if (ink[y * w + x]) last = x; if (x - last <= r) tmp[y * w + x] = 1; } last = 1e9; for (let x = w - 1; x >= 0; x--) { if (ink[y * w + x]) last = x; if (last - x <= r) tmp[y * w + x] = 1; } }
+  for (let x = 0; x < w; x++) { let last = -1e9; for (let y = 0; y < h; y++) { if (tmp[y * w + x]) last = y; if (y - last <= r) dl[y * w + x] = 1; } last = 1e9; for (let y = h - 1; y >= 0; y--) { if (tmp[y * w + x]) last = y; if (last - y <= r) dl[y * w + x] = 1; } }
+  const lab = new Int32Array(w * h).fill(-1); let best = -1, bestScore = 0, bb = { x0: 0, y0: 0, x1: 0, y1: 0 }; const st: number[] = [];
+  for (let i = 0; i < w * h; i++) { if (!dl[i] || lab[i] >= 0) continue; let x0 = w, y0 = h, x1 = 0, y1 = 0, inkC = 0, dense = 0; st.push(i); lab[i] = i;
+    while (st.length) { const j = st.pop()!; const x = j % w, y = (j / w) | 0; x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); if (ink[j]) { inkC++; if (cnt[j] > k * k * 0.6) dense++; }
+      for (const q of [j - 1, j + 1, j - w, j + w]) if (q >= 0 && q < w * h && dl[q] && lab[q] < 0 && Math.abs((q % w) - x) <= 1) { lab[q] = i; st.push(q); } }
+    const score = dense > 0.75 * inkC ? inkC * 0.1 : inkC; if (score > bestScore) { bestScore = score; best = i; bb = { x0, y0, x1, y1 }; } }
+  const notes: string[] = []; if (best < 0) return { cv: src, box: null, notes };
+  const pad = -Math.round(Math.max(w, h) * 0.02); const box = { x: Math.max(0, Math.round((bb.x0 + pad) * k)), y: Math.max(0, Math.round((bb.y0 + pad) * k)), w: 0, h: 0 }; box.w = Math.min(W, Math.round((bb.x1 + 1 - pad) * k)) - box.x; box.h = Math.min(H, Math.round((bb.y1 + 1 - pad) * k)) - box.y;
+  if (box.w * box.h > (screenshot ? 0.9 : 0.5) * W * H || box.w < W * 0.2 || box.h < H * 0.1) return { cv: src, box: null, notes };
+  const sc = Math.max(box.w, box.h) < 1300 ? Math.min(2.2, maxSide / Math.max(box.w, box.h)) : 1; const out = document.createElement('canvas'); out.width = Math.round(box.w * sc); out.height = Math.round(box.h * sc); const c = out.getContext('2d', { willReadFrequently: true })!;
+  c.fillStyle = '#fff'; c.fillRect(0, 0, out.width, out.height); c.imageSmoothingEnabled = true; c.imageSmoothingQuality = 'high'; c.drawImage(src, box.x, box.y, box.w, box.h, 0, 0, out.width, out.height);
+  notes.push(`cropped to the drawing${sc > 1.05 ? ` (enlarged ${sc.toFixed(1)}×)` : ''}`); return { cv: out, box, notes };
+}
 export function prepare(src: HTMLCanvasElement): { cv: HTMLCanvasElement; notes: string[] } {
   const W = src.width, H = src.height; const g = grayOf(src); const notes: string[] = []; const n = W * H;
+  // colored markup (red pen, green engineer stamps, yellow highlighter) on a black-and-white drawing: drop it
+  { const d = src.getContext('2d', { willReadFrequently: true })!.getImageData(0, 0, W, H).data; let col = 0; const isCol = (i: number) => { const r = d[i * 4], gg = d[i * 4 + 1], b = d[i * 4 + 2]; return Math.max(r, gg, b) - Math.min(r, gg, b) > 70; };
+    for (let i = 0; i < n; i += 7) if (isCol(i)) col++; const frac = col * 7 / n;
+    if (frac > 0.0005 && frac < 0.06) { for (let i = 0; i < n; i++) if (isCol(i)) g[i] = 255; notes.push('colored marks removed'); } }
   let sum = 0; for (let i = 0; i < n; i++) sum += g[i];
   if (sum / n < 110) { for (let i = 0; i < n; i++) g[i] = 255 - g[i]; notes.push('inverted'); }
   const f = Math.max(1, Math.round(Math.max(W, H) / 300)); const w = Math.ceil(W / f), h = Math.ceil(H / f); const sm = new Float32Array(w * h);
@@ -137,12 +178,12 @@ function extract(m: Uint8Array, W: number, H: number, o: 'h' | 'v', Lmin: number
 // ---------------- OCR ----------------
 let ocrWorker: any = null;
 export async function ocr(cv: HTMLCanvasElement, onProgress?: (s: string) => void): Promise<OcrWord[]> {
-  const T: any = await import('tesseract.js');
-  if (!ocrWorker) {
+  let T: any; try { T = await import('tesseract.js'); } catch (e) { console.warn('OCR unavailable', e); return []; }
+  if (!ocrWorker) try {
     onProgress?.('Loading text reader (first time only)…');
-    ocrWorker = await T.createWorker('eng', 1, { logger: (m: any) => { if (m.status === 'recognizing text') onProgress?.(`Reading text ${Math.round(m.progress * 100)}%`); } });
+    const base = new URL(((import.meta as any).env?.BASE_URL || '/') + 'tesseract/', location.href).href; ocrWorker = await T.createWorker('eng', 1, { workerPath: base + 'worker.min.js', corePath: base, langPath: base + 'lang', workerBlobURL: false, logger: (m: any) => { if (m.status === 'recognizing text') onProgress?.(`Reading text ${Math.round(m.progress * 100)}%`); } });
     await ocrWorker.setParameters({ tessedit_pageseg_mode: '11', preserve_interword_spaces: '1' });
-  }
+  } catch (e) { console.warn('OCR unavailable (offline?)', e); ocrWorker = null; return []; }
   const { data } = await ocrWorker.recognize(cv, {}, { blocks: true });
   const words: OcrWord[] = []; let ln = 0;
   for (const b of data.blocks || []) for (const p of b.paragraphs || []) for (const l of p.lines || []) { ln++; for (const w of l.words || []) { const t = (w.text || '').trim(); if (!t) continue; words.push({ text: t, x0: w.bbox.x0, y0: w.bbox.y0, x1: w.bbox.x1, y1: w.bbox.y1, line: ln, conf: w.confidence }); } }
@@ -165,6 +206,8 @@ function dimsFromWords(words: OcrWord[]): DDim[] {
     for (let i = 0; i < ws.length; i++) for (let n = 1; n <= 3 && i + n <= ws.length; n++) { // join up to 3 neighbouring words ("12'" "-" "6"")
       const g = ws.slice(i, i + n); if (n > 1 && g.some((w, k) => k && w.x0 - g[k - 1].x1 > (w.y1 - w.y0) * 1.2)) break;
       const txt = g.map(w => w.text).join(n > 1 ? ' ' : ''); const v = parseDim(txt) ?? parseDim(g.map(w => w.text).join(''));
+      if (v && v > 0.5 && /^(CLG|CEIL|AFF|A\.F\.F|TRAY|VAULT|PLATE|T\.?O\.?W)/i.test(ws[i + n]?.text || '')) { i += n - 1; break; } // ceiling / height notes are not lengths
+      if (v && /m$/i.test(txt.trim()) && !/mm$/i.test(txt.trim()) && !/\d[.,]\d/.test(txt)) { i += n - 1; break; } // '10M', '518m' (scale bars, notes) are not dimensions
       if (v && v > 0.5) { out.push({ text: txt, m: v, x0: g[0].x0, y0: Math.min(...g.map(w => w.y0)), x1: g[g.length - 1].x1, y1: Math.max(...g.map(w => w.y1)) }); i += n - 1; break; }
     }
   }
@@ -226,14 +269,14 @@ export async function analyze(img: CanvasImageSource & { width: number; height: 
     const L = walk(1) - walk(-1);
     if (L > (d.x1 - d.x0) * 0.8) { d.px = L / k; ratios.push({ r: d.m / L, d }); }
   }
-  let mpp = 0; let scaleFrom: 'ocr' | 'guess' = 'guess'; let scaleNote = '';
+  let mpp = 0; let scaleFrom: 'ocr' | 'guess' | 'area' = 'guess'; let scaleNote = '';
   if (ratios.length) {
     let bestSet: typeof ratios = []; for (const a of ratios) { const set = ratios.filter(b => Math.abs(b.r / a.r - 1) < 0.025); if (set.length > bestSet.length) bestSet = set; }
     const r = bestSet.reduce((s, x) => s + x.r, 0) / bestSet.length; const thickMax = Math.max(0, ...segs.map(s => s.t));
     const plausible = !thickMax || (thickMax * r > 2.5 * IN && thickMax * r < 20 * IN);
-    if ((bestSet.length >= 2 || ratios.length === 1) && plausible) { mpp = r; scaleFrom = 'ocr'; scaleNote = `from ${bestSet.length} dimension${bestSet.length > 1 ? 's' : ''} (${bestSet.map(x => x.d.text).slice(0, 3).join(', ')})`; }
+    if ((bestSet.length >= 2 || (ratios.length === 1 && /['"’”]/.test(ratios[0].d.text))) && plausible) { mpp = r; scaleFrom = 'ocr'; scaleNote = `from ${bestSet.length} dimension${bestSet.length > 1 ? 's' : ''} (${bestSet.map(x => x.d.text).slice(0, 3).join(', ')})`; }
   }
-  if (opts.forceMpp) { mpp = opts.forceMpp; scaleFrom = 'ocr'; scaleNote = opts.forceNote || 'set'; }
+  if (opts.forceMpp) { mpp = opts.forceMpp; scaleFrom = (opts as any).keepGuess ? 'guess' : 'ocr'; scaleNote = opts.forceNote || 'set'; }
   if (!mpp) { const tk = segs.map(s => s.t).sort((a, b) => b - a); const ref = tk.length ? tk[Math.min(2, tk.length - 1)] : 0; mpp = ref ? (8 * IN) / ref : (50 * FT) / maxD; scaleNote = ref ? 'guessed from wall thickness — please confirm' : 'unknown — please set it'; }
   const px = (m: number) => m / mpp;
   // 4) pair thin parallel lines → double-line walls
@@ -379,11 +422,21 @@ export async function analyze(img: CanvasImageSource & { width: number; height: 
       if (Math.abs(r / mpp - 1) > 0.08) return analyze(img, { ...opts, forceMpp: r, forceNote: note, words });
       mpp = r; scaleFrom = 'ocr'; scaleNote = note; }
   }
+  // still a guess: typical swing doors are 32" wide — a better ruler than wall thickness on small screenshots
+  if (scaleFrom === 'guess' && !opts.forceMpp) {
+    const dw = dOps.filter(o => o.kind === 'door' && (o.style === 'interior' || o.style === 'exterior')).map(o => o.w * k).sort((a, b) => a - b);
+    if (dw.length >= 3) { const r = (32 * IN) / dw[dw.length >> 1]; if (Math.abs(r / mpp - 1) > 0.08) return analyze(img, { ...opts, forceMpp: r, forceNote: `guessed from ${dw.length} door widths (32" typical) — please check one wall`, words, keepGuess: true } as any); }
+  }
+  // ceiling heights written in the rooms ("10'-0" CLG") → wall height
+  let ceiling: number | null = null; { const hs: number[] = []; for (const ws2 of lineMap.values()) { const t = ws2.sort((a, b) => a.x0 - b.x0).map(w => w.text).join(' '); const m = /(\d{1,2}\s*'?\s*-?\s*\d{0,2}\s*"?)\s*(CLG|CEIL)/i.exec(t); const v = m ? parseDim(m[1].replace(/\s/g, '')) ?? parseDim(m[1].replace(/\s/g, '').replace(/^(\d+)-/, "$1'-")) : null; if (v && v > 7 * FT && v < 16 * FT) hs.push(v); }
+    if (hs.length >= 2) { const cnt = new Map<number, number>(); hs.forEach(v => cnt.set(Math.round(v / IN), (cnt.get(Math.round(v / IN)) || 0) + 1)); ceiling = [...cnt].sort((a, b) => b[1] - a[1])[0][0] * IN; } }
+  const allTxt = words.map(w => w.text).join(' ').toUpperCase(); const elevations = (allTxt.match(/ELEVATION/g) || []).length;
+  { const m = /TOP\s*OF\s*(WALL|PLATE)[^0-9]{0,24}(\d{1,2}\s*'?\s*-?\s*\d{1,2}\s*"?)/.exec(allTxt); const v = m ? parseDim(m[2].replace(/\s/g, '')) : null; if (v && v > 7 * FT && v < 16 * FT) ceiling = v; }
   const scale = (p: { x: number; y: number }) => ({ x: p.x / k, y: p.y / k });
   const walls = dWalls.map(w => ({ a: scale(w.a), b: scale(w.b), t: w.t / k, ext: w.ext }));
   const longestDim = dims.reduce<DDim | null>((b, d) => (!b || d.m > b.m ? d : b), null);
   const sc = (d: DDim) => ({ ...d, x0: d.x0 / k, y0: d.y0 / k, x1: d.x1 / k, y1: d.y1 / k });
-  return { w: W / k, h: H / k, walls, openings: dOps, rooms: dRooms, mpp: mpp * k, scaleFrom, scaleNote, dims: dims.map(sc), longestDim: longestDim ? sc(longestDim) : null, ocrOk, words: words.map(w => ({ ...w, x0: w.x0 / k, y0: w.y0 / k, x1: w.x1 / k, y1: w.y1 / k })), ms: performance.now() - t0 };
+  return { w: W / k, h: H / k, walls, openings: dOps, rooms: dRooms, mpp: mpp * k, ceiling, elevations, scaleFrom, scaleNote, dims: dims.map(sc), longestDim: longestDim ? sc(longestDim) : null, ocrOk, words: words.map(w => ({ ...w, x0: w.x0 / k, y0: w.y0 / k, x1: w.x1 / k, y1: w.y1 / k })), ms: performance.now() - t0 };
 }
 const ROOMWORD = /\b(bed|bdrm|br|bath|ba|wc|toilet|kitchen|kit|living|liv|dining|din|family|great|garage|gar|master|mstr|closet|clo|wic|laundry|util|utility|pantry|porch|lanai|patio|deck|den|office|study|foyer|entry|lobby|hall|nook|bonus|media|game|loft|mud|storage|stor|mech|lr|dr|k|pool|cabana|guest|suite|room)\b/i;
 /** "12'0" X 14'0"", "12'-6" x 10'", "12 x 14" (feet) → [m, m] */
@@ -438,3 +491,34 @@ export function deskew(src: HTMLCanvasElement): { cv: HTMLCanvasElement; deg: nu
   c.fillStyle = '#fff'; c.fillRect(0, 0, out.width, out.height); c.translate(out.width / 2, out.height / 2); c.rotate(a); c.drawImage(src, -src.width / 2, -src.height / 2);
   return { cv: out, deg: best };
 }
+
+/** Area of everything closed in by the walls (outside flood-fill), in detection pixels². */
+export function footprintPx(det: Detection): number {
+  const f = Math.min(1, 900 / Math.max(det.w, det.h)); const W = Math.ceil(det.w * f) + 2, H = Math.ceil(det.h * f) + 2; const c = document.createElement('canvas'); c.width = W; c.height = H; const x = c.getContext('2d', { willReadFrequently: true })!;
+  x.fillStyle = '#fff'; x.fillRect(0, 0, W, H); x.strokeStyle = '#000'; x.lineCap = 'square'; for (const w of det.walls) { x.lineWidth = Math.max(3, w.t * f + 3); x.beginPath(); x.moveTo(w.a.x * f + 1, w.a.y * f + 1); x.lineTo(w.b.x * f + 1, w.b.y * f + 1); x.stroke(); }
+  const d = x.getImageData(0, 0, W, H).data; const out = new Uint8Array(W * H); const st = [0]; out[0] = 1;
+  while (st.length) { const j = st.pop()!; const px = j % W; for (const q of [j - 1, j + 1, j - W, j + W]) { if (q < 0 || q >= W * H || out[q] || Math.abs((q % W) - px) > 1 || d[q * 4] < 128) continue; out[q] = 1; st.push(q); } }
+  let n = 0; for (let i = 0; i < W * H; i++) if (!out[i]) n++; return n / (f * f);
+}
+export interface AreaTable { ac?: number; garage?: number; lanai?: number; entry?: number; underRoof?: number; text: string }
+/** Reads a "BUILDING AREA" table (A/C living, garage, lanai, under roof) from the sheet around the drawing. */
+export async function readAreaTable(page: HTMLCanvasElement, skip: { x: number; y: number; w: number; h: number } | null, onProgress?: (s: string) => void): Promise<AreaTable | null> {
+  const W = page.width, H = page.height; const sb = skip || { x: 0, y: 0, w: 0, h: 0 };
+  const regs = skip ? [[0, sb.y + sb.h, W, H - sb.y - sb.h], [sb.x + sb.w, 0, W - sb.x - sb.w, H], [0, 0, W, sb.y], [0, 0, sb.x, H]].filter(r => r[2] > 40 && r[3] > 40) : [[0, 0, W, H]];
+  const words: OcrWord[] = [];
+  for (const [x0, y0, w, h] of regs) { const sc = Math.min(4, 4000 / Math.max(w, h)); const c = document.createElement('canvas'); c.width = Math.round(w * sc); c.height = Math.round(h * sc); const x = c.getContext('2d')!; x.imageSmoothingQuality = 'high'; x.drawImage(page, x0, y0, w, h, 0, 0, c.width, c.height);
+    const ws = await ocr(c, onProgress); const base = words.length ? Math.max(...words.map(q => q.line)) + 1 : 0; ws.forEach(q => words.push({ ...q, line: q.line + base })); }
+  // group into rows by height (sparse-text mode puts each word on its own "line")
+  const rows: OcrWord[][] = []; for (const w of [...words].sort((a, b) => (a.y0 + a.y1) - (b.y0 + b.y1))) { const cy = (w.y0 + w.y1) / 2, hh = w.y1 - w.y0; const r = rows.find(r2 => r2[0].line === w.line - (w.line - r2[0].line) && Math.abs((r2[0].y0 + r2[0].y1) / 2 - cy) < Math.max(hh, r2[0].y1 - r2[0].y0) * 0.5 && Math.abs(r2[0].line - w.line) < 1e6); if (r) r.push(w); else rows.push([w]); }
+  // split rows with a big horizontal gap (table vs. stamp text next to it)
+  const lines = new Map<number, OcrWord[]>(); let li = 0; for (const r of rows) { r.sort((a, b) => a.x0 - b.x0); let cur: OcrWord[] = []; for (const w of r) { const hh = w.y1 - w.y0; if (cur.length && w.x0 - cur[cur.length - 1].x1 > hh * 25) { lines.set(li++, cur); cur = []; } cur.push(w); } if (cur.length) lines.set(li++, cur); }
+  const T: AreaTable = { text: '' }; const num = (t: string) => { const m = /(\d{1,2},?\d{3}|\d{2,4})\s*(SQ|SF|S\.F)/i.exec(t) || /(\d{1,2},?\d{3}|\d{2,4})\s*$/.exec(t); return m ? +m[1].replace(',', '') : 0; };
+  for (const ws of lines.values()) { const t = ws.sort((a, b) => a.x0 - b.x0).map(w => w.text).join(' ').toUpperCase(); const v = num(t); if (!v) continue;
+    if (/UNDER\s*ROOF/.test(t)) T.underRoof = v; else if (/NON/.test(t)) continue; else if (/LIVING|A\/C|CONDITIONED/.test(t)) T.ac = v; else if (/GARAGE/.test(t)) T.garage = v; else if (/LANAI|PORCH|PATIO/.test(t)) T.lanai = (T.lanai || 0) + v; else if (/ENTRY/.test(t)) T.entry = v; }
+  if (T.ac && T.ac < 800) delete T.ac; if (T.garage && (T.garage < 150 || T.garage > 1500)) delete T.garage; if (T.underRoof && T.underRoof < 900) delete T.underRoof;
+  const parts = [T.ac && `A/C living ${T.ac}`, T.garage && `garage ${T.garage}`, T.lanai && `lanai ${T.lanai}`, T.entry && `entry ${T.entry}`, T.underRoof && `under roof ${T.underRoof}`].filter(Boolean);
+  T.text = parts.join(', '); return parts.length ? T : null;
+}
+
+/** Download the text reader once (≈15 MB) so plan reading works offline later. */
+export async function warmOcr() { const base = new URL(((import.meta as any).env?.BASE_URL || '/') + 'tesseract/', location.href).href; for (const f of ['worker.min.js', 'tesseract-core-simd-lstm.wasm.js', 'tesseract-core-lstm.wasm.js', 'lang/eng.traineddata.gz']) { try { await fetch(base + f); } catch { return false; } } return true; }

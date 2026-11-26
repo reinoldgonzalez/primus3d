@@ -89,7 +89,9 @@ export async function shareOrDownload(blob: Blob, name: string) {
 }
 
 // ================= Permit sheets (site plan, pool plan, pool barrier) =================
-import { setbacks, edgeName, lotArea } from './site';
+import { setbacks, edgeName, lotArea, setbackIssues } from './site';
+/** jsPDF's built-in fonts only have Latin-1/WinAnsi: swap the symbols the app uses for plain text. */
+const pdfSafe = (t: any): any => Array.isArray(t) ? t.map(pdfSafe) : typeof t !== 'string' ? t : t.replace(/→/g, '->').replace(/✓/g, 'OK').replace(/[⚠️]/g, '!').replace(/×/g, 'x').replace(/[≥]/g, '>=').replace(/[≤]/g, '<=').replace(/[^\x00-\xff–—‘’“”•…]/g, '');
 import { takeoff, options, optionPrice, money } from './takeoff';
 import { getBiz } from './share';
 const FTm = 0.3048;
@@ -118,13 +120,13 @@ function titleBlock(doc: any, PW: number, PH: number, sheet: string, num: string
   doc.setFont('helvetica', 'normal'); doc.setFontSize(8);
   for (const t of [P.client && 'Owner: ' + P.client, P.address && 'Site: ' + P.address, P.geo?.parcel && 'Parcel: ' + P.geo.parcel]) if (t) { const L = doc.splitTextToSize(t, w - 20); doc.text(L, x + 10, y); y += 11 * L.length; }
   const yb = PH - 150; doc.line(x, yb, x + w, yb); doc.setFont('helvetica', 'bold'); doc.setFontSize(12); doc.text(sheet, x + 10, yb + 20);
-  doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.text(`Scale: 1" = ${ftPerIn}'-0"`, x + 10, yb + 36); doc.text('(when printed at 100% on 11x17)', x + 10, yb + 47); doc.text('Date: ' + new Date().toLocaleDateString(), x + 10, yb + 62);
+  doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.text(ftPerIn ? `Scale: 1" = ${ftPerIn}'-0"` : 'Scale: as noted', x + 10, yb + 36); doc.text(ftPerIn ? '(when printed at 100% on 11x17)' : '(key plan scale shown under it)', x + 10, yb + 47); doc.text('Date: ' + new Date().toLocaleDateString(), x + 10, yb + 62);
   doc.setFont('helvetica', 'bold'); doc.setFontSize(22); doc.text(num, x + w - 50, PH - 40);
   doc.setFont('helvetica', 'normal'); doc.setFontSize(6.5); doc.text(doc.splitTextToSize('Prepared with Primus 3D. Lot lines from public parcel data are approximate; verify against a signed survey. Contractor to verify all dimensions and code requirements with the local building department.', w - 20), x + 10, PH - 80);
   return x;
 }
 export async function exportPermitPDF() {
-  const { jsPDF } = await import('jspdf'); const P = store.p; const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'tabloid' });
+  const { jsPDF } = await import('jspdf'); const P = store.p; const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'tabloid' }); const t0 = doc.text.bind(doc); (doc as any).text = (t: any, ...a: any[]) => t0(pdfSafe(t), ...a);
   const PW = doc.internal.pageSize.getWidth(), PH = doc.internal.pageSize.getHeight(); const drawW = (PW - 200 - 50) / 72, drawH = (PH - 40 - 30) / 72;
   const all: { x: number; y: number }[] = [...(P.lot || [])]; P.walls.forEach(w => all.push(w.a, w.b)); P.rooms.forEach(r => all.push(...r.pts)); P.objects.forEach(o => all.push(...objCorners(o)));
   if (!all.length) all.push({ x: 0, y: 0 }, { x: 10, y: 10 });
@@ -133,11 +135,15 @@ export async function exportPermitPDF() {
   { const s = scaledCanvas(boxOf(all, 3), drawW, drawH); doc.addImage(s.cv.toDataURL('image/jpeg', 0.9), 'JPEG', 25, 20, drawW * 72, drawH * 72);
     titleBlock(doc, PW, PH, 'SITE PLAN', 'C-1', s.ftPerIn); northArrow(doc, 60, 60, P.northDeg || 0); scaleBar(doc, 40, PH - 40, s.ftPerIn);
     // impervious & setback table
-    let y = 110; const x = 35; doc.setFillColor(255, 255, 255); doc.rect(x - 6, y - 14, 230, 16 + 12 * 14, 'F'); doc.setFont('helvetica', 'bold'); doc.setFontSize(9); doc.text('SITE DATA', x, y); doc.setFont('helvetica', 'normal'); doc.setFontSize(8);
-    const lotA = P.lot && P.lot.length > 2 ? lotArea(P.lot) / SQ : 0; const rows: [string, string][] = [];
-    if (lotA) rows.push(['Lot area', `${Math.round(lotA).toLocaleString()} sq ft`]); rows.push(['Building (under roof, interior)', `${Math.round(T.floorSf).toLocaleString()} sq ft`]); rows.push(['Impervious total', `${Math.round(T.imperviousSf).toLocaleString()} sq ft`]); if (lotA) rows.push(['Impervious coverage', `${(100 * T.imperviousSf / lotA).toFixed(1)} %`]);
-    for (const sb of setbacks(P).sort((a, b) => a.what.localeCompare(b.what))) rows.push([`${sb.what} → ${edgeName(P, sb.edge)} lot line`, fmtLen(sb.d, { short: true })]);
-    for (const [k, v] of rows.slice(0, 12)) { y += 12; doc.text(k, x, y); doc.text(v, x + 215, y, { align: 'right' }); }
+    const lotA = P.lot && P.lot.length > 2 ? lotArea(P.lot) / SQ : 0; const rows: [string, string][] = []; const FL: any = (P as any).flood || {};
+    if (lotA) rows.push(['Lot area', `${Math.round(lotA).toLocaleString()} sq ft`]); rows.push(['Building footprint (under roof)', `${Math.round((T as any).footprintSf || T.floorSf).toLocaleString()} sq ft`]); rows.push(['Impervious total', `${Math.round(T.imperviousSf).toLocaleString()} sq ft`]); if (lotA) rows.push(['Impervious coverage', `${(100 * T.imperviousSf / lotA).toFixed(1)} %`]);
+    rows.push(['Flood zone', FL.zone || '____']); rows.push(['Base flood elevation (BFE)', FL.bfe != null ? `${FL.bfe} ft ${FL.datum || 'NAVD88'}` : '____ ft NAVD88']); rows.push(['Finish floor elevation (FFE)', FL.ffe != null ? `${FL.ffe} ft NAVD88` : '____ ft NAVD88']);
+    rows.push(['SETBACKS (provided / required)', '']);
+    for (const sb of setbacks(P).sort((a, b) => a.what.localeCompare(b.what) || edgeName(P, a.edge).localeCompare(edgeName(P, b.edge)))) rows.push([`${sb.what} to ${edgeName(P, sb.edge)} line (${sb.edge + 1})`, `${fmtLen(Math.max(0, sb.d), { short: true })} / ${sb.need ? fmtLen(sb.need, { short: true }) : '-'}${sb.bad ? '  !' : ''}`]);
+    const iss = setbackIssues(P); const n = Math.min(rows.length, 30);
+    let y = 100; const x = 35; doc.setFillColor(255, 255, 255); doc.rect(x - 6, y - 14, 250, 20 + 11 * (n + iss.length + 1), 'F'); doc.setFont('helvetica', 'bold'); doc.setFontSize(9); doc.text('SITE DATA', x, y); doc.setFont('helvetica', 'normal'); doc.setFontSize(7.5);
+    for (const [k, v] of rows.slice(0, n)) { y += 11; if (!v) doc.setFont('helvetica', 'bold'); doc.text(k, x, y); doc.setFont('helvetica', 'normal'); doc.text(v, x + 238, y, { align: 'right' }); }
+    if (iss.length) { doc.setTextColor(200, 0, 0); for (const t of iss) { y += 11; doc.text('! ' + t, x, y); } doc.setTextColor(0); }
   }
   // ---- C-2 pool plan ----
   const pool = P.objects.filter(o => /^pool|^cage$|^pad$|^spa/.test(o.kind)); const deck = P.rooms.filter(r => r.outdoor && /pavers|travertine|concrete|stamped|pool/.test(r.floor));
@@ -154,13 +160,14 @@ export async function exportPermitPDF() {
     doc.addPage('tabloid', 'landscape'); titleBlock(doc, PW, PH, 'POOL BARRIER', 'C-3', 0);
     const barrier = P.objects.filter(o => /^cage$|^fence|^gate/.test(o.kind)); let y = 50; const x = 40;
     doc.setFont('helvetica', 'bold'); doc.setFontSize(14); doc.text('Residential swimming pool barrier', x, y); y += 22; doc.setFontSize(10); doc.text('Barrier on this job:', x, y); doc.setFont('helvetica', 'normal');
-    for (const o of barrier) { y += 14; doc.text(`• ${o.name} — ${fmtLen(o.w, { short: true })} x ${fmtLen(o.d, { short: true })}, height ${fmtLen(o.h, { short: true })}`, x + 10, y); }
+    let lf = 0; for (const o of barrier) { const L = o.kind === 'cage' ? 2 * (o.w + o.d) : o.w; lf += L; y += 14; doc.text(`• ${o.name} - ${o.kind === 'cage' ? fmtLen(o.w, { short: true }) + ' x ' + fmtLen(o.d, { short: true }) + ', ' : ''}${Math.round(L / FTm)} LF, height ${fmtLen(o.h, { short: true })}`, x + 10, y); }
+    const gates = P.objects.filter(o => /gate/.test(o.kind)).length + P.openings.filter(o => o.kind !== 'window' && P.objects.some(c => c.kind === 'cage')).length * 0; if (barrier.length) { y += 14; doc.setFont('helvetica', 'bold'); doc.text(`Barrier total: ${Math.round(lf / FTm)} LF · gates/doors in barrier: ${gates || 1} (self-closing, self-latching, open outward)`, x + 10, y); doc.setFont('helvetica', 'normal'); }
     if (!barrier.length) { y += 14; doc.text('• (add a screen cage or pool fence to the design)', x + 10, y); }
     y += 26; doc.setFont('helvetica', 'bold'); doc.text('Typical requirements (Florida Building Code – Residential, Sec. R4501.17 / F.S. Ch. 515):', x, y); doc.setFont('helvetica', 'normal');
-    const notes = ['Barrier at least 4 ft (48") high measured on the outside, with no gaps that allow a 4" sphere to pass.', 'Barrier placed around the perimeter of the pool, separate from any fence/hedge/wall unless that wall is part of the barrier.', 'Gates open outward away from the pool, are self-closing and self-latching; release at least 54" above grade (or on the pool side, 3" below the top, with no openings > 1/2" within 18").', 'A screen enclosure may serve as the barrier when it meets these requirements.', 'Where a house wall is part of the barrier, doors with direct access to the pool need an exit alarm, or self-closing / self-latching hardware with release at least 54" above the floor.', 'At least one pool safety feature per F.S. 515.27 (barrier, approved safety cover, door/window alarms, or self-closing/latching doors).', 'Verify the current code edition and local amendments with the City of Cape Coral / Lee County building department before submittal.'];
+    const notes = ['Barrier at least 4 ft (48") high measured on the outside, with no gaps that allow a 4" sphere to pass.', 'Barrier placed around the perimeter of the pool, separate from any fence/hedge/wall unless that wall is part of the barrier.', 'Gates open outward away from the pool, are self-closing and self-latching; release at least 54" above grade (or on the pool side, 3" below the top, with no openings > 1/2" within 18").', 'A screen enclosure may serve as the barrier when it meets these requirements.', 'Where a house wall is part of the barrier, doors with direct access to the pool need an exit alarm, or self-closing / self-latching hardware with release at least 54" above the floor.', 'At least one pool safety feature per F.S. 515.27 (barrier, approved safety cover, door/window alarms, or self-closing/latching doors).', 'City of Cape Coral (since 3/1/2026, Notice to Industry 2-2-26): the pool safety barrier (fence, screen enclosure or screen-room pan roof) needs its OWN Safety Barrier Permit, separate from the pool permit, with NOC, burrowing owl affidavit, site plan/survey showing the barrier and barrier construction details.', 'City of Cape Coral: a final survey is required for pool/spa permits (Notice to Industry, amended 2/10/2026) - check the notice for the required elevations.', 'Verify the current code edition and local amendments with the City of Cape Coral / Lee County building department before submittal.'];
     for (const n of notes) { const L = doc.splitTextToSize('• ' + n, PW - 300); y += 14; doc.text(L, x + 10, y); y += 11 * (L.length - 1); }
     // small key plan
-    const pts = [...pool.flatMap(o => objCorners(o)), ...barrier.flatMap(o => objCorners(o))]; const s = scaledCanvas(boxOf(pts, 3), 7, 5, 120); doc.addImage(s.cv.toDataURL('image/jpeg', 0.9), 'JPEG', x, PH - 30 - 5 * 72, 7 * 72, 5 * 72); doc.setFontSize(8); doc.text(`Key plan, 1" = ${s.ftPerIn}'-0"`, x, PH - 24);
+    const pts = [...pool.flatMap(o => objCorners(o)), ...barrier.flatMap(o => objCorners(o))]; P.walls.forEach(w => { if (pts.length && Math.min(...pts.map(q => Math.hypot(q.x - w.a.x, q.y - w.a.y))) < 12) pts.push(w.a, w.b); }); const s = scaledCanvas(boxOf(pts, 4), 7, 4.6, 120); const ky = Math.max(y + 20, PH - 30 - 4.6 * 72); doc.addImage(s.cv.toDataURL('image/jpeg', 0.9), 'JPEG', x, ky, 7 * 72, 4.6 * 72); doc.setFontSize(8); doc.text(`Key plan, 1" = ${s.ftPerIn}'-0"`, x, PH - 24);
   }
   return doc.output('blob');
 }
