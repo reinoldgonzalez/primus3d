@@ -60,7 +60,7 @@ export function drawSite(c: CanvasRenderingContext2D, P: Project, px: number, di
   // lot edge lengths (outside)
   const cx = L.reduce((s, p) => s + p.x, 0) / L.length, cy = L.reduce((s, p) => s + p.y, 0) / L.length;
   c.font = `600 ${11 * px}px system-ui, sans-serif`; c.textAlign = 'center'; c.textBaseline = 'middle';
-  for (let i = 0; i < L.length; i++) { const a = L[i], b = L[(i + 1) % L.length]; const m = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }; const len = dist(a, b); if (len < 1) continue; let nx = -(b.y - a.y) / len, ny = (b.x - a.x) / len; if (nx * (m.x - cx) + ny * (m.y - cy) < 0) { nx = -nx; ny = -ny; }
+  for (let i = 0; i < L.length; i++) { const a = L[i], b = L[(i + 1) % L.length]; const m = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }; const len = dist(a, b); if (len < 1 || len / px < 90) continue; let nx = -(b.y - a.y) / len, ny = (b.x - a.x) / len; if (nx * (m.x - cx) + ny * (m.y - cy) < 0) { nx = -nx; ny = -ny; }
     const t = `${edgeName(P, i).toUpperCase()} ${fmtLen(len, { short: true })}`; const q = { x: m.x + nx * 14 * px, y: m.y + ny * 14 * px }; let ang = Math.atan2(b.y - a.y, b.x - a.x); if (ang > Math.PI / 2) ang -= Math.PI; if (ang < -Math.PI / 2) ang += Math.PI;
     c.save(); c.translate(q.x, q.y); c.rotate(ang); c.fillStyle = print ? '#000' : '#2b8a3e'; c.fillText(t, 0, 0); c.restore(); }
   if (dims) for (const s of setbacks(P)) {

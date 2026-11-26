@@ -726,7 +726,7 @@ async function startFromAddress() {
     let blob: Blob | null = null; try { blob = await usgsImage(o.lat, o.lon, ext, 1024); } catch (e) { console.warn(e); }
     closeModal();
     store.mutate(p => {
-      p.address = q; p.geo = { lat: o.lat, lon: o.lon, address: g.label, parcel, source: lot ? 'Lee County Property Appraiser parcels' : '' }; p.northDeg = 0;
+      p.address = q; if (/^Untitled/.test(p.name)) p.name = q.split(',')[0]; p.geo = { lat: o.lat, lon: o.lon, address: g.label, parcel, source: lot ? 'Lee County Property Appraiser parcels' : '' }; p.northDeg = 0;
       if (lot) { p.lot = lot.map(q2 => ({ x: snapIn(q2.x), y: snapIn(q2.y) })); (p as any).lotFront = guessFront(p.lot!); }
       if (blob) { const id = uid(); store.assets.set(id, blob); p.background = { assetId: id, x: -ext / 2, y: -ext / 2, mpp: ext / 1024, rot: 0, opacity: 0.85, wpx: 1024, hpx: 1024, locked: true, visible: true, name: 'USGS aerial' }; }
     });
