@@ -1,0 +1,43 @@
+// Small DOM helpers: modal dialogs, sheet, toast.
+export const $ = <T extends HTMLElement = HTMLElement>(sel: string) => document.querySelector(sel) as T;
+export function h(tag: string, attrs: Record<string, any> = {}, ...kids: (Node | string | null | undefined | false)[]): HTMLElement {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (v == null || v === false) continue;
+    if (k.startsWith('on')) el.addEventListener(k.slice(2), v); else if (k === 'class') el.className = v; else if (k === 'html') el.innerHTML = v; else if (k === 'style') el.setAttribute('style', v); else (el as any)[k] = v === true ? true : v, el.setAttribute(k, v === true ? '' : String(v));
+  }
+  for (const c of kids) if (c != null && c !== false) el.append(c as any);
+  return el;
+}
+let toastT: any;
+export function toast(msg: string, ms = 2600) { const t = $('#toast'); t.textContent = msg; t.classList.add('show'); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('show'), ms); }
+
+export function modal(title: string, body: HTMLElement | string, buttons: { label: string; primary?: boolean; danger?: boolean; value?: any }[] = [{ label: 'OK', primary: true, value: true }], opts: { wide?: boolean; onOpen?: (el: HTMLElement) => void } = {}): Promise<any> {
+  return new Promise(res => {
+    const root = $('#modal'); root.innerHTML = '';
+    const close = (v: any) => { root.classList.remove('open'); root.innerHTML = ''; res(v); };
+    const box = h('div', { class: 'mbox' + (opts.wide ? ' wide' : '') },
+      h('div', { class: 'mhead' }, h('h2', {}, title), h('button', { class: 'x', 'aria-label': 'Close', onclick: () => close(null) }, '✕')),
+      typeof body === 'string' ? h('div', { class: 'mbody', html: body }) : h('div', { class: 'mbody' }, body),
+      buttons.length ? h('div', { class: 'mfoot' }, ...buttons.map(b => h('button', { class: 'btn' + (b.primary ? ' primary' : '') + (b.danger ? ' danger' : ''), onclick: () => close(b.value ?? b.label) }, b.label))) : null);
+    root.append(h('div', { class: 'mback', onclick: () => close(null) }), box); root.classList.add('open');
+    (root as any)._close = close; opts.onOpen?.(box);
+  });
+}
+export function closeModal(v: any = null) { const r: any = $('#modal'); r._close?.(v); }
+
+export async function prompt(title: string, label: string, value = '', hint = ''): Promise<string | null> {
+  const inp = h('input', { class: 'inp big', value, autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false' }) as HTMLInputElement;
+  const body = h('div', {}, h('label', { class: 'lbl' }, label), inp, hint ? h('p', { class: 'muted' }, hint) : null);
+  inp.addEventListener('keydown', e => { if (e.key === 'Enter') closeModal(inp.value); });
+  const r = await modal(title, body, [{ label: 'Cancel', value: null }, { label: 'OK', primary: true, value: '__ok' }], { onOpen: () => setTimeout(() => { inp.focus(); inp.select(); }, 60) });
+  if (r === '__ok') return inp.value; return typeof r === 'string' ? r : null;
+}
+export function pickFile(accept: string, capture?: string): Promise<File | null> {
+  return new Promise(res => {
+    const i = document.createElement('input'); i.type = 'file'; if (accept) i.accept = accept; if (capture) i.setAttribute('capture', capture);
+    i.style.display = 'none'; document.body.appendChild(i);
+    i.onchange = () => { res(i.files?.[0] || null); i.remove(); };
+    i.click();
+  });
+}

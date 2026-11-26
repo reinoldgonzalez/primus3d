@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<title>Primus 3D</title>
+<meta name="description" content="Design rooms, homes and yards to exact size and show customers in 3D. Free." />
+<meta name="theme-color" content="#1f2933" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Primus 3D" />
+<meta name="format-detection" content="telephone=no" />
+<link rel="apple-touch-icon" href="apple-touch-icon.png" />
+<link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png" />
+</head>
+<body>
+<div id="app" data-view="plan">
+  <header id="top">
+    <button id="menuBtn" class="ib" aria-label="Menu">☰</button>
+    <button id="pname" class="pname">Untitled</button>
+    <span id="saved" class="saved"></span>
+    <div class="sp"></div>
+    <button id="undo" class="ib" aria-label="Undo" title="Undo">↶</button>
+    <button id="redo" class="ib" aria-label="Redo" title="Redo">↷</button>
+    <button id="helpBtn" class="ib" aria-label="Help">?</button>
+    <button id="shareBtn" class="ib accent" aria-label="Share / export">⇪ <span class="hide-sm">Share</span></button>
+  </header>
+  <nav id="views">
+    <button data-v="plan" class="on">2D Plan</button><button data-v="3d">3D</button><button data-v="walk">Walk</button><button data-v="photo">Photo</button>
+    <button id="splitBtn" class="splitb" title="Plan + 3D side by side">◫</button>
+  </nav>
+  <main id="stage">
+    <canvas id="plan"></canvas>
+    <div id="v3d"></div>
+    <canvas id="photo"></canvas>
+    <div id="hint"></div>
+    <div id="draftbar" style="display:none"></div>
+    <div id="ctxbar" style="display:none"></div>
+    <div id="joy"><i></i></div>
+  </main>
+  <div id="totals"></div>
+  <footer id="dock"></footer>
+  <section id="sheet" class="sheet"></section>
+  <div id="modal"></div>
+  <div id="toast"></div>
+</div>
+<script type="module" src="/src/main.ts"></script>
+</body>
+</html>
