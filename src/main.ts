@@ -58,6 +58,8 @@ function renderDock() {
   const d = $('#dock'); d.innerHTML = ''; let btns: DockBtn[] = [];
   if (view === 'plan') btns = [
     { id: 'select', icon: '👆', label: 'Select', on: plan.tool === 'select', act: () => setTool('select') },
+    ...(store.p.background ? [{ id: 'aer', icon: store.p.background.visible ? '🙈' : '🛰️', label: store.p.background.visible ? (store.p.geo ? 'Hide aerial' : 'Hide image') : (store.p.geo ? 'Show aerial' : 'Show image'), act: () => { store.mutate(p => { if (p.background) p.background.visible = !p.background.visible; }); renderDock(); plan.redraw(); } }] : []),
+    { id: 'site', icon: '🟩', label: 'Site area', on: plan.tool === 'room' && !!plan.roomPreset, act: () => siteMenu() },
     { id: 'quick', icon: '⬛', label: 'Quick room', act: () => quickRoom() },
     { id: 'wall', icon: '📏', label: 'Draw walls', on: plan.tool === 'wall', act: () => setTool('wall') },
     { id: 'room', icon: '🔷', label: 'Floor / area', on: plan.tool === 'room', act: () => areaMenu() },
@@ -96,7 +98,7 @@ function renderDock() {
   if (view === 'photo' && photo.selId) d.append(h('button', { class: 'tool', onclick: () => photo.scaleSel(1.2) }, h('span', { class: 'ti' }, '➕'), h('span', { class: 'tl' }, 'Bigger')), h('button', { class: 'tool', onclick: () => photo.scaleSel(1 / 1.2) }, h('span', { class: 'ti' }, '➖'), h('span', { class: 'tl' }, 'Smaller')), h('button', { class: 'tool', onclick: () => photo.flipSel() }, h('span', { class: 'ti' }, '↔️'), h('span', { class: 'tl' }, 'Flip')), h('button', { class: 'tool danger', onclick: () => photo.deleteSel() }, h('span', { class: 'ti' }, '🗑️'), h('span', { class: 'tl' }, 'Delete')));
   if (view === 'photo' && (photo.tool === 'area' || photo.tool === 'curb') && photo.draft.length) d.append(h('button', { class: 'tool primary', onclick: () => { photo.finishDraft(); renderDock(); updateHint(); } }, h('span', { class: 'ti' }, '✅'), h('span', { class: 'tl' }, 'Done')));
 }
-function setTool(t: Tool) { if (view !== 'plan') setView('plan'); plan.setTool(t); renderDock(); updateHint(); }
+function setTool(t: Tool) { if (view !== 'plan') setView('plan'); if (t !== 'room') plan.roomPreset = null; plan.setTool(t); renderDock(); updateHint(); }
 
 const HINTS: Record<string, string> = {
   select: 'Tap anything to select it. Drag to move. Drag the round handles to resize. Pinch to zoom, drag empty space to pan.',
@@ -429,7 +431,15 @@ function addRect(W: number, L: number, name: string, kind: 'room' | 'floor' | 'o
   toast(`${name}: ${fmtArea(W * L)}. Add doors with 🚪.`);
   return room;
 }
+const SITE_PRESETS: [string, string, string][] = [['Driveway', 'concrete', '🚗'], ['Walkway', 'pavers', '🚶'], ['Patio', 'pavers', '🪑'], ['Pool deck', 'travertine', '🏊'], ['Lawn / sod', 'grass', '🌱'], ['Planting bed', 'mulch', '🌺'], ['Mulch', 'mulch', '🟫'], ['Gravel', 'rock', '🪨'], ['Concrete pad', 'concrete', '⬜']];
+async function siteMenu() {
+  const r = await modal('Site area', h('div', {}, h('p', { class: 'muted' }, 'Pick what it is, then tap its corners on the aerial (tap the first corner or ✅ Done to finish). Corners snap to lot lines and the house.'),
+    h('div', { class: 'menu' }, ...SITE_PRESETS.map(([n, f, i]) => h('button', { class: 'mi', onclick: () => closeModal(n) }, h('span', { class: 'mii' }, i), n)))), []);
+  const pr = SITE_PRESETS.find(x => x[0] === r); if (!pr) return;
+  plan.roomPreset = { name: pr[0], floor: pr[1], outdoor: true }; setTool('room'); renderDock(); toast(`${pr[0]}: tap the corners`, 3000);
+}
 async function areaMenu() {
+  plan.roomPreset = null;
   const r = await modal('Floor / area', h('div', { class: 'menu' },
     h('button', { class: 'mi', onclick: () => closeModal('fill') }, h('span', { class: 'mii' }, '🪣'), 'Fill inside walls (tap inside a room)'),
     h('button', { class: 'mi', onclick: () => closeModal('draw') }, h('span', { class: 'mii' }, '✏️'), 'Draw corners (rooms, patios, beds, driveways)'),

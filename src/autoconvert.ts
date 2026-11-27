@@ -1,3 +1,4 @@
+import { ppReady, ppRead, type PPRead } from './ppocr';
 /**
  * Blueprint auto-convert (free, runs fully in the browser, no cloud vision API).
  * Classic computer vision written in plain TypeScript (same steps as an OpenCV pipeline, without the 8 MB download):
@@ -9,12 +10,12 @@
 export interface DWall { a: { x: number; y: number }; b: { x: number; y: number }; t: number; ext: boolean }
 export interface DOpening { wall: number; at: number; w: number; kind: 'door' | 'window' | 'opening'; style: string; flip: boolean; hingeRight: boolean }
 export interface DRoom { pts: { x: number; y: number }[]; name: string }
-export interface DDim { text: string; m: number; x0: number; y0: number; x1: number; y1: number; px?: number }
+export interface DDim { text: string; m: number; x0: number; y0: number; x1: number; y1: number; px?: number; v?: boolean; item?: number }
 export interface Detection {
   w: number; h: number; walls: DWall[]; openings: DOpening[]; rooms: DRoom[];
-  mpp: number; scaleFrom: 'ocr' | 'guess' | 'area'; ceiling?: number | null; elevations?: number; scaleNote: string; dims: DDim[]; longestDim: DDim | null; ocrOk: boolean; words: OcrWord[]; ms: number;
+  mpp: number; scaleFrom: 'ocr' | 'guess' | 'area'; ceiling?: number | null; elevations?: number; scaleNote: string; askDim?: { text: string; m: number; px: number; x0: number; y0: number; x1: number; y1: number } | null; cands?: { x0: number; y0: number; x1: number; y1: number; v: boolean; px: number; text: string }[]; dims: DDim[]; longestDim: DDim | null; ocrOk: boolean; words: OcrWord[]; ms: number;
 }
-export interface OcrWord { text: string; x0: number; y0: number; x1: number; y1: number; line: number; conf: number }
+export interface OcrWord { text: string; x0: number; y0: number; x1: number; y1: number; line: number; conf: number; vert?: boolean }
 type Seg = { o: 'h' | 'v'; c: number; a: number; b: number; t: number; src: 'thick' | 'pair' | 'thin'; glazed?: [number, number][] };
 
 const FT = 0.3048, IN = 0.0254;
@@ -189,12 +190,33 @@ export async function ocr(cv: HTMLCanvasElement, onProgress?: (s: string) => voi
   for (const b of data.blocks || []) for (const p of b.paragraphs || []) for (const l of p.lines || []) { ln++; for (const w of l.words || []) { const t = (w.text || '').trim(); if (!t) continue; words.push({ text: t, x0: w.bbox.x0, y0: w.bbox.y0, x1: w.bbox.x1, y1: w.bbox.y1, line: ln, conf: w.confidence }); } }
   return words;
 }
+let ocrWorker2: any = null; let ocr2Params = '';
+/** Second reader with its own settings (single-line / digits-only passes). */
+export async function ocrWith(cv: HTMLCanvasElement, params: Record<string, string>): Promise<{ words: OcrWord[]; text: string; conf: number }> {
+  let T: any; try { T = await import('tesseract.js'); } catch { return { words: [], text: '', conf: 0 }; }
+  if (!ocrWorker2) try { const base = new URL(((import.meta as any).env?.BASE_URL || '/') + 'tesseract/', location.href).href; ocrWorker2 = await T.createWorker('eng', 1, { workerPath: base + 'worker.min.js', corePath: base, langPath: base + 'lang', workerBlobURL: false }); } catch { return { words: [], text: '', conf: 0 }; }
+  const ps = JSON.stringify(params); if (ps !== ocr2Params) { await ocrWorker2.setParameters({ tessedit_char_whitelist: '', ...params }); ocr2Params = ps; }
+  const { data } = await ocrWorker2.recognize(cv, {}, { blocks: true }); const words: OcrWord[] = []; let ln = 0;
+  for (const b of data.blocks || []) for (const p of b.paragraphs || []) for (const l of p.lines || []) { ln++; for (const w of l.words || []) { const t = (w.text || '').trim(); if (t) words.push({ text: t, x0: w.bbox.x0, y0: w.bbox.y0, x1: w.bbox.x1, y1: w.bbox.y1, line: ln, conf: w.confidence }); } }
+  return { words, text: (data.text || '').trim(), conf: data.confidence || 0 };
+}
 /** "12'-6"", "12' 6", "12'6 1/2"", "40'", "3.5m", "3500mm" → meters */
+/** Clean up how text readers garble dimensions: °/* as inch marks, ~ or / for the foot mark, O→0 and I/l→1 in numbers, ½ ¼ ¾, lost fraction slash (9'-1012" = 9'-10½"). */
+export function normDim(s: string): string {
+  let t = s.replace(/[’′`´‘~]/g, "'").replace(/[”″“°*]|''/g, '"').replace(/½/g, ' 1/2').replace(/¼/g, ' 1/4').replace(/¾/g, ' 3/4');
+  t = t.replace(/(?<=[\d'-])[Oo](?=[\d"'\s]|$)/g, '0').replace(/(?<=^|[\d'-])[Oo](?=\d)/g, '0').replace(/(?<=[\d'-]|^)[Il|](?=[\d'"-])/g, '1').replace(/(?<=\d)[Il|](?=$|["'\s])/g, '1');
+  t = t.replace(/(\d)\/['-]/g, "$1'-").replace(/(?<=['-])g(?=["\s]|$)/g, '9').replace(/'-'/g, "'-").replace(/\s*-\s*/g, '-').replace(/\s+/g, ' ').trim();
+  t = t.replace(/^(\d{1,3}'?-\d{1,2})'$/, '$1"'); // inch mark read as a foot mark
+  // inches with a fraction whose space or slash was lost: 1311/2 → 13'-1 1/2 handled below; -1012" → -10 1/2"
+  let m = /^(\d{1,3})('?-|')(\d{1,2})(\d)\/?(2|4|8)"?$/.exec(t); if (m && +m[3] < 12 && +m[4] < +m[5]) t = `${m[1]}'-${m[3]} ${m[4]}/${m[5]}"`;
+  m = /^(\d{1,3})('?-|')(\d)(\d)\/(2|4|8)"?$/.exec(t); if (m && +m[4] < +m[5]) t = `${m[1]}'-${m[3]} ${m[4]}/${m[5]}"`;
+  return t;
+}
 export function parseDim(s: string): number | null {
-  const t = s.replace(/[’′`´]/g, "'").replace(/[”″]|''/g, '"').replace(/\s+/g, ' ').trim();
+  const t = normDim(s);
   let m = t.match(/^(\d{1,3})\s*'\s*-?\s*(\d{1,2})?(?:\s+(\d{1,2})\/(\d{1,2}))?\s*"?$/);
   if (m) { const ft = +m[1], inch = m[2] ? +m[2] : 0, fr = m[3] ? +m[3] / +m[4] : 0; if (inch >= 12) return null; return ft * FT + (inch + fr) * IN; }
-  m = t.match(/^(\d{1,3})\s*-\s*(\d{1,2})\s*"$/); if (m && +m[2] < 12) return +m[1] * FT + +m[2] * IN; // apostrophe lost by OCR: 14-0"
+  m = t.match(/^(\d{1,3})\s*-\s*(\d{1,2})(?:\s+(\d{1,2})\/(\d{1,2}))?\s*"$/); if (m && +m[2] < 12) return +m[1] * FT + (+m[2] + (m[3] ? +m[3] / +m[4] : 0)) * IN; // apostrophe lost by OCR: 14-0"
   m = t.match(/^(\d{1,3}(?:\.\d+)?)\s*m$/i); if (m) return +m[1];
   m = t.match(/^(\d{3,5})\s*mm$/i); if (m) return +m[1] / 1000;
   return null;
@@ -206,9 +228,9 @@ function dimsFromWords(words: OcrWord[]): DDim[] {
     for (let i = 0; i < ws.length; i++) for (let n = 1; n <= 3 && i + n <= ws.length; n++) { // join up to 3 neighbouring words ("12'" "-" "6"")
       const g = ws.slice(i, i + n); if (n > 1 && g.some((w, k) => k && w.x0 - g[k - 1].x1 > (w.y1 - w.y0) * 1.2)) break;
       const txt = g.map(w => w.text).join(n > 1 ? ' ' : ''); const v = parseDim(txt) ?? parseDim(g.map(w => w.text).join(''));
-      if (v && v > 0.5 && /^(CLG|CEIL|AFF|A\.F\.F|TRAY|VAULT|PLATE|T\.?O\.?W)/i.test(ws[i + n]?.text || '')) { i += n - 1; break; } // ceiling / height notes are not lengths
+      if (v && v > 0.5 && /^(C[LI1l]G|CEIL|AFF|A\.F\.F|TRAY|VAULT|PLATE|T\.?O\.?W)/i.test(ws[i + n]?.text || '')) { i += n - 1; break; } // ceiling / height notes are not lengths
       if (v && /m$/i.test(txt.trim()) && !/mm$/i.test(txt.trim()) && !/\d[.,]\d/.test(txt)) { i += n - 1; break; } // '10M', '518m' (scale bars, notes) are not dimensions
-      if (v && v > 0.5) { out.push({ text: txt, m: v, x0: g[0].x0, y0: Math.min(...g.map(w => w.y0)), x1: g[g.length - 1].x1, y1: Math.max(...g.map(w => w.y1)) }); i += n - 1; break; }
+      if (v && v > 0.5) { out.push({ text: txt, v: g.some(w => w.vert), m: v, x0: g[0].x0, y0: Math.min(...g.map(w => w.y0)), x1: g[g.length - 1].x1, y1: Math.max(...g.map(w => w.y1)) }); i += n - 1; break; }
     }
   }
   return out;
@@ -225,6 +247,135 @@ function cleanForOcr(cv: HTMLCanvasElement, D: Uint8Array, segs: Seg[], W: numbe
   c.putImageData(id, 0, 0); c.fillStyle = '#fff';
   for (const s of segs) { const ht = s.t / 2 + 2; if (s.o === 'h') c.fillRect(s.a - 2, s.c - ht, s.b - s.a + 4, 2 * ht); else c.fillRect(s.c - ht, s.a - 2, 2 * ht, s.b - s.a + 4); }
   return out;
+}
+
+// ---------------- text-line OCR (small print) ----------------
+// Plans are usually photographed or screenshotted far too small for the text reader (dimension text 5–10 px tall).
+// Find every little text line (horizontal or vertical) on the drawing, enlarge each one to ~32 px letters, binarize,
+// pack them onto a few clean pages and read those. Each word is mapped back to where it sits on the plan.
+type TItem = { x0: number; y0: number; x1: number; y1: number; v: boolean; ch: number; id: number; rot?: 1 | -1 };
+export function findTextItems(g: Uint8Array, thr: number, W: number, H: number): { items: TItem[]; ch: number } {
+  const maxD = Math.max(W, H); const lab = new Int32Array(W * H); type C = { x0: number; y0: number; x1: number; y1: number; n: number };
+  const comps: C[] = []; const st: number[] = [];
+  for (let s = 0; s < W * H; s++) { if (lab[s] || g[s] > thr) continue; const c: C = { x0: W, y0: H, x1: 0, y1: 0, n: 0 }; lab[s] = comps.length + 1; st.push(s);
+    while (st.length) { const p = st.pop()!; const x = p % W, y = (p / W) | 0; c.n++; if (x < c.x0) c.x0 = x; if (x > c.x1) c.x1 = x; if (y < c.y0) c.y0 = y; if (y > c.y1) c.y1 = y;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { const xx = x + dx, yy = y + dy; if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue; const q = yy * W + xx; if (!lab[q] && g[q] <= thr) { lab[q] = lab[s]; st.push(q); } } }
+    comps.push(c); }
+  const big = 0.08 * maxD;
+  const ok = comps.filter(c => { const w = c.x1 - c.x0 + 1, h = c.y1 - c.y0 + 1; return c.n >= 3 && w <= big && h <= big && !(Math.max(w, h) > 7 * Math.min(w, h) && Math.max(w, h) > 12); });
+  const hs = ok.map(c => c.y1 - c.y0 + 1).filter(h => h >= 4).sort((a, b) => a - b); const ch = hs.length ? Math.max(4, hs[(hs.length * 0.6) | 0]) : 8;
+  const cand = ok.filter(c => Math.min(c.y1 - c.y0, c.x1 - c.x0) + 1 <= 0.025 * maxD);
+  // horizontal lines: union chars that overlap vertically and sit close side by side
+  const par = cand.map((_, i) => i); const find = (i: number): number => (par[i] === i ? i : (par[i] = find(par[i])));
+  const join = (vert: boolean, use: (i: number) => boolean) => { const idx = cand.map((_, i) => i).filter(use).sort((a, b) => vert ? cand[a].y0 - cand[b].y0 : cand[a].x0 - cand[b].x0);
+    for (let p = 0; p < idx.length; p++) { const A = cand[idx[p]]; for (let q = p + 1; q < idx.length; q++) { const B = cand[idx[q]];
+      const gap = vert ? B.y0 - A.y1 : B.x0 - A.x1; if (gap > Math.max(2.5 * ch, 0.025 * maxD)) break; const hA = vert ? A.x1 - A.x0 + 1 : A.y1 - A.y0 + 1, hB = vert ? B.x1 - B.x0 + 1 : B.y1 - B.y0 + 1; if (gap > Math.max(1.1 * ch, 0.45 * Math.max(hA, hB))) continue; const ov = vert ? Math.min(A.x1, B.x1) - Math.max(A.x0, B.x0) : Math.min(A.y1, B.y1) - Math.max(A.y0, B.y0);
+      const ha = vert ? A.x1 - A.x0 : A.y1 - A.y0, hb = vert ? B.x1 - B.x0 : B.y1 - B.y0; const ca = vert ? (A.x0 + A.x1) / 2 : (A.y0 + A.y1) / 2, cb = vert ? (B.x0 + B.x1) / 2 : (B.y0 + B.y1) / 2;
+      if (ov >= 0.35 * Math.min(ha, hb) || (Math.abs(ca - cb) < 0.6 * ch)) par[find(idx[q])] = find(idx[p]); } } };
+  const groups = (sel: number[]) => { const m = new Map<number, number[]>(); for (const i of sel) { const r = find(i); (m.get(r) || m.set(r, []).get(r)!).push(i); } return [...m.values()]; };
+  join(false, () => true);
+  const items: TItem[] = []; const used = new Set<number>();
+  const box = (ix: number[]) => ({ x0: Math.min(...ix.map(i => cand[i].x0)), y0: Math.min(...ix.map(i => cand[i].y0)), x1: Math.max(...ix.map(i => cand[i].x1)), y1: Math.max(...ix.map(i => cand[i].y1)) });
+  for (const gI of groups(cand.map((_, i) => i))) { if (gI.length < 2) continue; const b = box(gI); const w = b.x1 - b.x0 + 1, h = b.y1 - b.y0 + 1; if (w >= 1.3 * h && h <= 0.03 * maxD) { items.push({ ...b, v: false, ch: h, id: items.length }); gI.forEach(i => used.add(i)); } }
+  // vertical lines (dimensions written along vertical dimension lines) from what is left
+  for (let i = 0; i < par.length; i++) par[i] = i; const rest = cand.map((_, i) => i).filter(i => !used.has(i)); const rs = new Set(rest); join(true, i => rs.has(i));
+  for (const gI of groups(rest)) { if (gI.length < 3) continue; const b = box(gI); const w = b.x1 - b.x0 + 1, h = b.y1 - b.y0 + 1; if (h >= 1.8 * w && w <= 0.03 * maxD) items.push({ ...b, v: true, ch: Math.min(w, 1.6 * ch), id: items.length }); }
+  return { items, ch };
+}
+/** OCR all text items at a readable size. Returns words in source pixels; word.line = item id (vertical items read both ways). */
+export async function ocrTextItems(src: HTMLCanvasElement, items: TItem[], say?: (s: string) => void, maxItems = 500): Promise<OcrWord[]> {
+  const PW = 2400, PH = 2400, GX = 70, GY = 46; type Pl = { it: TItem; rot: 0 | 1 | -1; s: number; x: number; y: number; w: number; h: number; page: number; pad: number };
+  const pls: Pl[] = []; let page = 0, cx = 20, cy = 20, rowH = 0;
+  const list: { it: TItem; rot: 0 | 1 | -1 }[] = items.slice(0, maxItems).flatMap(it => (it.v ? [{ it, rot: 1 }, { it, rot: -1 }] : [{ it, rot: 0 }]) as { it: TItem; rot: 0 | 1 | -1 }[]);
+  for (const { it, rot } of list) {
+    const s = Math.max(1, Math.min(5, 32 / Math.max(3, it.ch))); const pad = Math.round(0.35 * it.ch + 2); const bw = it.x1 - it.x0 + 1 + 2 * pad, bh = it.y1 - it.y0 + 1 + 2 * pad;
+    const w = Math.round((rot ? bh : bw) * s), h = Math.round((rot ? bw : bh) * s); if (w > PW - 40) continue;
+    if (cx + w > PW - 20) { cx = 20; cy += rowH + GY; rowH = 0; } if (cy + h > PH - 20) { page++; cx = 20; cy = 20; rowH = 0; }
+    pls.push({ it, rot, s, x: cx, y: cy, w, h, page, pad }); cx += w + GX; rowH = Math.max(rowH, h);
+  }
+  const words: OcrWord[] = [];
+  for (let p = 0; p <= page; p++) {
+    const here = pls.filter(q => q.page === p); if (!here.length) continue; say?.(`Reading the small print ${p + 1}/${page + 1}…`);
+    const cv = document.createElement('canvas'); cv.width = PW; cv.height = Math.min(PH, Math.max(...here.map(q => q.y + q.h)) + 30); const c = cv.getContext('2d', { willReadFrequently: true })!;
+    c.fillStyle = '#fff'; c.fillRect(0, 0, cv.width, cv.height); c.imageSmoothingEnabled = true; c.imageSmoothingQuality = 'high';
+    for (const q of here) { const it = q.it; const sx = it.x0 - q.pad, sy = it.y0 - q.pad, sw = it.x1 - it.x0 + 1 + 2 * q.pad, sh = it.y1 - it.y0 + 1 + 2 * q.pad;
+      c.save(); c.translate(q.x + q.w / 2, q.y + q.h / 2); if (q.rot) c.rotate(q.rot * Math.PI / 2); c.drawImage(src, sx, sy, sw, sh, -sw * q.s / 2, -sh * q.s / 2, sw * q.s, sh * q.s); c.restore(); }
+    // binarize (sharp black text on white reads far better than blurry grey)
+    const id = c.getImageData(0, 0, cv.width, cv.height); const g = new Uint8Array(cv.width * cv.height); for (let i = 0; i < g.length; i++) g[i] = (id.data[i * 4] * 77 + id.data[i * 4 + 1] * 150 + id.data[i * 4 + 2] * 29) >> 8;
+    const dark: number[] = []; for (let i = 0; i < g.length; i += 7) if (g[i] < 250) dark.push(g[i]); const BM = (globalThis as any).__p3dBin ?? 999; const t = dark.length > 50 ? Math.max(40, Math.min(200, otsu(Uint8Array.from(dark)) + BM)) : 140;
+    if (BM !== 999) { for (let i = 0; i < g.length; i++) { const v = g[i] <= t ? 0 : 255; id.data[i * 4] = id.data[i * 4 + 1] = id.data[i * 4 + 2] = v; } c.putImageData(id, 0, 0); }
+    (globalThis as any).__p3dTextPages = [...((globalThis as any).__p3dTextPages || []).slice(-5), cv];
+    const ws = await ocr(cv, say);
+    for (const w of ws) { const mx = (w.x0 + w.x1) / 2, my = (w.y0 + w.y1) / 2; const q = here.find(q2 => mx >= q2.x && mx <= q2.x + q2.w && my >= q2.y && my <= q2.y + q2.h); if (!q) continue; const it = q.it;
+      const line = it.id * 4 + (q.rot === 0 ? 0 : q.rot === 1 ? 1 : 2);
+      if (q.rot) words.push({ ...w, x0: it.x0, y0: it.y0, x1: it.x1, y1: it.y1, line, vert: true } as OcrWord);
+      else words.push({ ...w, x0: it.x0 - q.pad + (w.x0 - q.x) / q.s, x1: it.x0 - q.pad + (w.x1 - q.x) / q.s, y0: it.y0 - q.pad + (w.y0 - q.y) / q.s, y1: it.y0 - q.pad + (w.y1 - q.y) / q.s, line }); }
+  }
+  // vertical items were read both ways round: keep the reading the reader is most sure of
+  const byIt = new Map<number, { r1: number[]; r2: number[] }>(); for (const w of words) if (w.vert) { const id = w.line >> 2; const e = byIt.get(id) || byIt.set(id, { r1: [], r2: [] }).get(id)!; ((w.line & 3) === 1 ? e.r1 : e.r2).push(w.conf * (/\d/.test(w.text) ? 1.2 : 1)); }
+  const score = (a: number[]) => a.length ? a.reduce((x, y) => x + y, 0) / a.length + 4 * Math.min(a.length, 3) : -1;
+  for (const [id, e] of byIt) { const it = items.find(i => i.id === id); if (it) it.rot = score(e.r1) >= score(e.r2) ? 1 : -1; }
+  return words.filter(w => { if (!w.vert) return true; const e = byIt.get(w.line >> 2)!; const keep = score(e.r1) >= score(e.r2) ? 1 : 2; return (w.line & 3) === keep; });
+}
+
+/** Loose reading of a dimension the text reader half-got ("25-4"", "26 8"", "52'0") → all plausible lengths in meters. */
+export function parseDimLoose(s: string): number[] {
+  const out: number[] = []; const t = s.replace(/[’′`´‘]/g, "'").replace(/[”″“]|''/g, '"').replace(/\s*-\s*/g, '-').replace(/\s+/g, ' ').trim();
+  const v = parseDim(t); if (v) out.push(v);
+  if (!out.length) { const flip = [...t].reverse().map(ch => ({ '6': '9', '9': '6', ',': "'", '.': "'", '„': '"' } as Record<string, string>)[ch] ?? ch).join('').replace(/''/g, '"'); const fv = parseDim(flip); if (fv) out.push(fv); } // upside-down text
+  let m = /^(\d{1,3})(?:'-?|-|'? )(\d{1,2})(?: (\d)\/(\d{1,2}))?"?$/.exec(t); if (m && +m[2] < 12) out.push(+m[1] * FT + (+m[2] + (m[3] ? +m[3] / +m[4] : 0)) * IN);
+  m = /^(\d{1,3})'$/.exec(t); if (m) out.push(+m[1] * FT);
+  return [...new Set(out.map(x => Math.round(x * 1e4) / 1e4))].filter(x => x > 0.5 && x < 120);
+}
+/** Is this text item sitting on a dimension line (a long thin line right under/over it, or beside it when vertical)? */
+function onDimLine(it: TItem, D: Uint8Array, W: number, H: number): boolean {
+  const len = it.v ? it.y1 - it.y0 : it.x1 - it.x0, ch = it.ch; const ca = it.v ? (it.y0 + it.y1) / 2 : (it.x0 + it.x1) / 2;
+  const run = (across: number) => { let n = 0; const a0 = Math.round(ca - len), a1 = Math.round(ca + len); for (let a = a0; a <= a1; a++) { let d = 0; for (let e = -1; e <= 1; e++) { const x = it.v ? across + e : a, y = it.v ? a : across + e; if (x >= 0 && y >= 0 && x < W && y < H && D[y * W + x]) d = 1; } n += d; } return n / (a1 - a0 + 1); };
+  const lo = it.v ? it.x0 : it.y0, hi = it.v ? it.x1 : it.y1;
+  for (let q = 1; q <= Math.ceil(1.6 * ch); q += 1) { if (run(Math.round(hi + q)) > 0.85 || run(Math.round(lo - q)) > 0.85) return true; }
+  return false;
+}
+/** Read dimension texts one row at a time (single-line mode, digits only, two sizes) — far more reliable than reading the whole sheet. */
+async function readDimItems(src: HTMLCanvasElement, its: TItem[], say?: (s: string) => void): Promise<DDim[]> {
+  const out: DDim[] = []; if (!its.length) return out; const PW = 2400, GX = 90;
+  for (const [hTarget, wl] of [[34, true], [26, true]] as [number, boolean][]) {
+    type Pl = { it: TItem; x: number; w: number; s: number; pad: number }; const rows: Pl[][] = [[]]; let cx = 20;
+    for (const it of its) { const s = Math.max(1, Math.min(6, hTarget / Math.max(3, it.ch))); const pad = Math.round(0.3 * it.ch + 2); const L = (it.v ? it.y1 - it.y0 : it.x1 - it.x0) + 1 + 2 * pad; const w = Math.round(L * s); if (w > PW - 40) continue;
+      if (cx + w > PW - 20) { rows.push([]); cx = 20; } rows[rows.length - 1].push({ it, x: cx, w, s, pad }); cx += w + GX; }
+    for (let ri = 0; ri < rows.length; ri++) { const row = rows[ri]; if (!row.length) continue; say?.(`Reading dimensions ${ri + 1}/${rows.length}…`);
+      const RH = Math.round(Math.max(...row.map(q => ((q.it.v ? q.it.x1 - q.it.x0 : q.it.y1 - q.it.y0) + 1 + 2 * q.pad) * q.s)) + 24);
+      const cv = document.createElement('canvas'); cv.width = PW; cv.height = RH; const c = cv.getContext('2d')!; c.fillStyle = '#fff'; c.fillRect(0, 0, PW, RH); c.imageSmoothingEnabled = true; c.imageSmoothingQuality = 'high';
+      for (const q of row) { const it = q.it; const sx = it.x0 - q.pad, sy = it.y0 - q.pad, sw = it.x1 - it.x0 + 1 + 2 * q.pad, sh = it.y1 - it.y0 + 1 + 2 * q.pad;
+        c.save(); c.translate(q.x + q.w / 2, RH / 2); if (it.v) c.rotate(Math.PI / 2 * (it.rot || -1)); c.drawImage(src, sx, sy, sw, sh, -sw * q.s / 2, -sh * q.s / 2, sw * q.s, sh * q.s); c.restore(); }
+      const R = await ocrWith(cv, { tessedit_pageseg_mode: '7', user_defined_dpi: '300', tessedit_char_whitelist: wl ? "0123456789'\"-/ " : '' });
+      // group the words of this row by item (x centre), then try every reading
+      const per = new Map<TItem, string[]>(); for (const w of R.words) { const mx = (w.x0 + w.x1) / 2; const q = row.find(q2 => mx >= q2.x - GX / 3 && mx <= q2.x + q2.w + GX / 3); if (!q) continue; (per.get(q.it) || per.set(q.it, []).get(q.it)!).push(w.text); }
+      ((globalThis as any).__p3dDimDbg ||= []).push(`${hTarget}${wl ? 'w' : ''} r${ri}: ${row.length} items → ${R.text}`);
+      for (const [it, ws] of per) { const txt = ws.join(' '); for (const m of parseDimLoose(txt)) out.push({ text: txt, m, x0: it.x0, y0: it.y0, x1: it.x1, y1: it.y1, v: it.v, item: it.id } as DDim); }
+    }
+  }
+  return out;
+}
+
+/** Read every text item with the PP-OCR recognizer (one crop per item, vertical items both ways round). */
+export async function ppTextItems(src: HTMLCanvasElement, items: TItem[], say?: (s: string) => void, maxItems = 600): Promise<OcrWord[]> {
+  const words: OcrWord[] = []; const list = items.slice(0, maxItems); let i = 0;
+  for (const it of list) {
+    if (++i % 40 === 0) { say?.(`Reading labels and dimensions ${Math.round(i / list.length * 100)}%`); await new Promise(r => setTimeout(r, 0)); }
+    const pad = Math.round(0.3 * it.ch + 2); const sx = it.x0 - pad, sy = it.y0 - pad, sw = it.x1 - it.x0 + 1 + 2 * pad, sh = it.y1 - it.y0 + 1 + 2 * pad;
+    const crop = (rot: 0 | 1 | -1 | 2) => { const q = rot === 1 || rot === -1; const c = document.createElement('canvas'); const s = Math.max(1, 64 / (q ? sw : sh)); c.width = Math.round((q ? sh : sw) * s); c.height = Math.round((q ? sw : sh) * s); const x = c.getContext('2d')!; x.fillStyle = '#fff'; x.fillRect(0, 0, c.width, c.height); x.imageSmoothingQuality = 'high';
+      x.translate(c.width / 2, c.height / 2); if (rot) x.rotate(rot * Math.PI / 2); x.drawImage(src, sx, sy, sw, sh, -sw * s / 2, -sh * s / 2, sw * s, sh * s); return c; };
+    let r: PPRead, rot: 0 | 1 | -1 = 0;
+    if (it.v) { const a = await ppRead(crop(-1)), b = await ppRead(crop(1)); const sc = (q: PPRead) => q.conf * Math.min(1, q.text.length / 3) + (parseDimLoose(q.text).length ? 15 : 0); [r, rot] = sc(a) >= sc(b) ? [a, -1] : [b, 1]; it.rot = rot as 1 | -1; }
+    else { r = await ppRead(crop(0)); const f = await ppRead(crop(2)); if (f.conf > r.conf + 10 && f.text.length >= r.text.length) r = f; } // upside-down text
+    if (!r.text.trim() || r.conf < 35) continue;
+    // split into words using where each character sat across the crop
+    let cur: { c: string; x: number }[] = []; const flush = () => { if (!cur.length) return; const tx = cur.map(q => q.c).join(''); const a = cur[0].x, b = cur[cur.length - 1].x; const span = Math.max(0.02, (b - a) / Math.max(1, cur.length - 1));
+      if (it.v) words.push({ text: tx, x0: it.x0, y0: it.y0, x1: it.x1, y1: it.y1, line: it.id * 4 + (rot === 1 ? 1 : 2), conf: r.conf, vert: true });
+      else words.push({ text: tx, x0: sx + (a - span / 2) * sw, x1: sx + (b + span / 2) * sw, y0: it.y0, y1: it.y1, line: it.id * 4, conf: r.conf }); cur = []; };
+    for (const ch of r.chars) { if (ch.c === ' ') flush(); else cur.push(ch); } flush();
+  }
+  return words;
 }
 
 // ---------------- main ----------------
@@ -252,30 +403,53 @@ export async function analyze(img: CanvasImageSource & { width: number; height: 
   const thin: Seg[] = []; for (const o of ['h', 'v'] as const) for (const s of extract(Tm, W, H, o, Lmin, 2)) if (s.t <= lw * 2 + 1) thin.push({ o, ...s, src: 'thin' });
   // 3) OCR → scale
   let words: OcrWord[] = []; let ocrOk = false;
-  if (opts.words) { words = opts.words; ocrOk = true; } else if (opts.useOcr !== false) { try { words = await ocr(cleanForOcr(cv, D, segs, W, H, Lmin), say); ocrOk = true; } catch (e) { console.warn('OCR unavailable', e); } }
-  const dims = dimsFromWords(words);
+  let textCh = 0; let usedPP = false; let dimItems: DDim[] = []; let tItems: TItem[] = (opts as any).tItems || [];
+  if (opts.words) { words = opts.words; ocrOk = true; textCh = (opts as any).textCh || 0; } else if (opts.useOcr !== false) { try {
+    const clean = cleanForOcr(cv, D, segs, W, H, Lmin); (globalThis as any).__p3dClean = clean; const ti = findTextItems(grayOf(clean), Math.min(225, Math.max(200, th + 40)), W, H); textCh = ti.ch; tItems = ti.items; (globalThis as any).__p3dItems = ti.items.map(i => ({ ...i, x0: i.x0 / k, y0: i.y0 / k, x1: i.x1 / k, y1: i.y1 / k }));
+    if (ti.items.length >= 4) { say(`Reading ${ti.items.length} labels and dimensions…`); if (!(globalThis as any).__p3dNoPP && await ppReady()) { words = await ppTextItems(clean, ti.items, say); usedPP = true; } else words = await ocrTextItems(clean, ti.items, say); }
+    if (words.length < 6) words = await ocr(clean, say); ocrOk = true;
+    const dI = usedPP ? [] : ti.items.filter(it => onDimLine(it, D, W, H)).slice(0, 120); dimItems = dI.length ? await readDimItems(clean, dI, say) : []; } catch (e) { console.warn('OCR unavailable', e); } }
+  else dimItems = (opts as any).dimItems || [];
+  const dims = [...dimsFromWords(words), ...dimItems.map(d => ({ ...d }))];
+  for (const d of dims) if (d.item == null) { const cx = (d.x0 + d.x1) / 2, cy = (d.y0 + d.y1) / 2; const it = tItems.find(i => cx >= i.x0 - 2 && cx <= i.x1 + 2 && cy >= i.y0 - 2 && cy <= i.y1 + 2); if (it) d.item = it.id; }
   const at = (x: number, y: number) => (x >= 0 && y >= 0 && x < W && y < H ? D[(y | 0) * W + (x | 0)] : 0);
   // match each horizontal dimension text to the dimension line under/over it, split at tick marks
   const ratios: { r: number; d: DDim }[] = [];
-  for (const d of dims) {
-    const cx = (d.x0 + d.x1) / 2, cy = (d.y0 + d.y1) / 2, hh = d.y1 - d.y0; let best: Seg | null = null, bd = Infinity;
-    for (const s of [...thin, ...segs]) { if (s.o !== 'h' || s.a > cx || s.b < cx) continue; const dy = Math.abs(s.c - cy); if (dy < 2.4 * hh + 4 && dy < bd && s.b - s.a >= (d.x1 - d.x0) * 0.8) { bd = dy; best = s; } }
-    if (!best) continue;
+  const spanLen = (d: { x0: number; y0: number; x1: number; y1: number; v?: boolean }) => {
+    const o: 'h' | 'v' = d.v ? 'v' : 'h'; const ca = o === 'h' ? (d.x0 + d.x1) / 2 : (d.y0 + d.y1) / 2, cc = o === 'h' ? (d.y0 + d.y1) / 2 : (d.x0 + d.x1) / 2, hh = o === 'h' ? d.y1 - d.y0 : d.x1 - d.x0, tl = o === 'h' ? d.x1 - d.x0 : d.y1 - d.y0, N = o === 'h' ? W : H;
+    const A = (al: number, ac: number) => (o === 'h' ? at(al, ac) : at(ac, al)); let best: Seg | null = null, bd = Infinity;
+    for (const s of [...thin, ...segs]) { if (s.o !== o || s.a > ca || s.b < ca) continue; const dy = Math.abs(s.c - cc); if (dy < 2.4 * hh + 4 && dy < bd && s.b - s.a >= tl * 0.8) { bd = dy; best = s; } }
+    if (!best) return 0;
     // walk along the dimension line in the raw mask from the text centre until a tick / arrow / extension line
     const c = Math.round(best.c), off = Math.ceil(best.t / 2) + 2;
-    const onLine = (x: number) => at(x, c) || at(x, c - 1) || at(x, c + 1);
-    const tick = (x: number) => { let up = 0, dn = 0; for (let q = off; q <= off + 4; q++) { up |= at(x, c - q); dn |= at(x, c + q); } return !!(up && dn); };
-    const walk = (dir: number) => { let x = Math.round(cx), gap = 0, last = x; for (let n = 0; n < W; n++, x += dir) { if (x < 0 || x >= W) break; if (tick(x)) { let e = x; while (tick(e + dir)) e += dir; return (x + e) / 2; } if (onLine(x)) { gap = 0; last = x; } else if (++gap > 3) break; } return last; };
-    const L = walk(1) - walk(-1);
-    if (L > (d.x1 - d.x0) * 0.8) { d.px = L / k; ratios.push({ r: d.m / L, d }); }
-  }
-  let mpp = 0; let scaleFrom: 'ocr' | 'guess' | 'area' = 'guess'; let scaleNote = '';
+    const onLine = (x: number) => A(x, c) || A(x, c - 1) || A(x, c + 1);
+    const tick = (x: number) => { let up = 0, dn = 0; for (let q = off; q <= off + 4; q++) { up |= A(x, c - q); dn |= A(x, c + q); } return !!(up && dn); };
+    const walk = (dir: number) => { let x = Math.round(ca), gap = 0, last = x; for (let n = 0; n < N; n++, x += dir) { if (x < 0 || x >= N) break; if (tick(x)) { let e = x; while (tick(e + dir)) e += dir; return (x + e) / 2; } if (onLine(x)) { gap = 0; last = x; } else if (++gap > 3) break; } return last; };
+    const L = walk(1) - walk(-1); return L > tl * 0.8 ? L : 0;
+  };
+  for (const d of dims) { const L = spanLen(d); if (L) { d.px = L / k; ratios.push({ r: d.m / L, d }); } }
+  let mpp = 0; let scaleFrom: 'ocr' | 'guess' | 'area' = 'guess'; let scaleNote = ''; let askDim: { text: string; m: number; px: number; x0: number; y0: number; x1: number; y1: number } | null = (opts as any).askDim || null;
   if (ratios.length) {
-    let bestSet: typeof ratios = []; for (const a of ratios) { const set = ratios.filter(b => Math.abs(b.r / a.r - 1) < 0.025); if (set.length > bestSet.length) bestSet = set; }
+    const keyOf = (d: DDim) => d.item ?? Math.round(d.x0) * 7919 + Math.round(d.y0); const nKeys = (a: typeof ratios) => new Set(a.map(x => keyOf(x.d))).size, nVals = (a: typeof ratios) => new Set(a.map(x => Math.round(x.d.m * 100))).size;
+    let bestSet: typeof ratios = []; for (const a of ratios.filter(x => x.d.px !== undefined)) { const set0 = ratios.filter(b => Math.abs(b.r / a.r - 1) < 0.025); const seen = new Set<number>(); const set = set0.filter(x => { const kk = keyOf(x.d); if (seen.has(kk)) return false; seen.add(kk); return true; }); if (set.length > bestSet.length || (set.length === bestSet.length && nVals(set) > nVals(bestSet))) bestSet = set; }
     const r = bestSet.reduce((s, x) => s + x.r, 0) / bestSet.length; const thickMax = Math.max(0, ...segs.map(s => s.t));
-    const plausible = !thickMax || (thickMax * r > 2.5 * IN && thickMax * r < 20 * IN);
-    if ((bestSet.length >= 2 || (ratios.length === 1 && /['"’”]/.test(ratios[0].d.text))) && plausible) { mpp = r; scaleFrom = 'ocr'; scaleNote = `from ${bestSet.length} dimension${bestSet.length > 1 ? 's' : ''} (${bestSet.map(x => x.d.text).slice(0, 3).join(', ')})`; }
+    // plausibility: walls 3–14" thick, the drawing's walls span 12–200 ft
+    const ws0 = segs.filter(q => q.src === 'thick'); const ext = ws0.length ? Math.max(Math.max(...ws0.map(q => q.o === 'h' ? q.b : q.c)) - Math.min(...ws0.map(q => q.o === 'h' ? q.a : q.c)), Math.max(...ws0.map(q => q.o === 'v' ? q.b : q.c)) - Math.min(...ws0.map(q => q.o === 'v' ? q.a : q.c))) : 0;
+    const plausibleR = (r2: number) => (!thickMax || (thickMax * r2 > 3 * IN && thickMax * r2 < 14 * IN)) && (!ext || (ext * r2 > 12 * FT && ext * r2 < 200 * FT));
+    const plausible = plausibleR(r);
+    // chain closure: two sub-dimensions that add up to an overall one (within 1") on lengths that add up too
+    let chain: typeof ratios | null = null;
+    for (const c of ratios) for (const a of ratios) for (const b of ratios) { if (chain || a === b || a === c || b === c || !a.d.px || !b.d.px || !c.d.px || keyOf(a.d) === keyOf(b.d) || !!a.d.v !== !!c.d.v || !!b.d.v !== !!c.d.v) continue;
+      if (Math.abs(a.d.m + b.d.m - c.d.m) <= IN && Math.abs(a.d.px + b.d.px - c.d.px) <= 0.02 * c.d.px && plausibleR(c.r)) chain = [c, a, b]; }
+    const strong = bestSet.length >= 2 && nVals(bestSet) >= 2;
+    if (chain && (!strong || Math.abs(chain[0].r / r - 1) > 0.025)) { bestSet = chain; }
+    if ((strong || chain) && plausibleR(bestSet === chain ? chain[0].r : r)) { mpp = bestSet === chain ? chain[0].r : r; scaleFrom = 'ocr'; scaleNote = bestSet === chain ? `from a dimension chain (${chain[1].d.text} + ${chain[2].d.text} = ${chain[0].d.text})` : `from ${bestSet.length} dimensions that agree (${bestSet.slice().sort((a2, b2) => b2.d.m - a2.d.m).map(x => normDim(x.d.text)).slice(0, 3).join(', ')})`; }
+    else { const one = ratios.filter(x => plausibleR(x.r)).sort((a2, b2) => b2.d.m - a2.d.m)[0]; if (one) askDim = { text: normDim(one.d.text), m: one.d.m, px: one.d.px || 0, x0: one.d.x0 / k, y0: one.d.y0 / k, x1: one.d.x1 / k, y1: one.d.y1 / k }; }
   }
+  // dimension lines the user can pick from (largest first) when the scale is not certain
+  const cands: { x0: number; y0: number; x1: number; y1: number; v: boolean; px: number; text: string }[] = [];
+  for (const it of tItems) { if (cands.length > 60) break; if (!onDimLine(it, D, W, H)) continue; const L = spanLen(it); if (!L) continue; const rd = dims.find(d => d.item === it.id && d.px); cands.push({ x0: it.x0 / k, y0: it.y0 / k, x1: it.x1 / k, y1: it.y1 / k, v: it.v, px: L / k, text: rd ? rd.text : '' }); }
+  cands.sort((a2, b2) => b2.px - a2.px);
   if (opts.forceMpp) { mpp = opts.forceMpp; scaleFrom = (opts as any).keepGuess ? 'guess' : 'ocr'; scaleNote = opts.forceNote || 'set'; }
   if (!mpp) { const tk = segs.map(s => s.t).sort((a, b) => b - a); const ref = tk.length ? tk[Math.min(2, tk.length - 1)] : 0; mpp = ref ? (8 * IN) / ref : (50 * FT) / maxD; scaleNote = ref ? 'guessed from wall thickness — please confirm' : 'unknown — please set it'; }
   const px = (m: number) => m / mpp;
@@ -418,17 +592,17 @@ export async function analyze(img: CanvasImageSource & { width: number; height: 
       if (dd < 0.12) cand.push({ r: (o[0] + o[1]) / 2, txt: txt.replace(/^.*?(\d)/, '$1') });
     }
     let bestSet: typeof cand = []; for (const a of cand) { const set = cand.filter(b => Math.abs(b.r / a.r - 1) < 0.07); if (set.length > bestSet.length) bestSet = set; }
-    if (bestSet.length >= 2 || (cand.length === 1)) { const r = bestSet.reduce((s2, x) => s2 + x.r, 0) / bestSet.length; const note = `from ${bestSet.length} room size${bestSet.length > 1 ? 's' : ''} (${bestSet.slice(0, 2).map(x => x.txt).join(', ')}) — please check one wall`;
-      if (Math.abs(r / mpp - 1) > 0.08) return analyze(img, { ...opts, forceMpp: r, forceNote: note, words });
+    if (bestSet.length >= 2 && new Set(bestSet.map(x => x.txt)).size >= 2) { const r = bestSet.reduce((s2, x) => s2 + x.r, 0) / bestSet.length; const note = `from ${bestSet.length} room size${bestSet.length > 1 ? 's' : ''} (${bestSet.slice(0, 2).map(x => x.txt).join(', ')}) — please check one wall`;
+      if (Math.abs(r / mpp - 1) > 0.08) return analyze(img, { ...opts, forceMpp: r, forceNote: note, words, dimItems, tItems, askDim } as any);
       mpp = r; scaleFrom = 'ocr'; scaleNote = note; }
   }
   // still a guess: typical swing doors are 32" wide — a better ruler than wall thickness on small screenshots
   if (scaleFrom === 'guess' && !opts.forceMpp) {
     const dw = dOps.filter(o => o.kind === 'door' && (o.style === 'interior' || o.style === 'exterior')).map(o => o.w * k).sort((a, b) => a - b);
-    if (dw.length >= 3) { const r = (32 * IN) / dw[dw.length >> 1]; if (Math.abs(r / mpp - 1) > 0.08) return analyze(img, { ...opts, forceMpp: r, forceNote: `guessed from ${dw.length} door widths (32" typical) — please check one wall`, words, keepGuess: true } as any); }
+    if (dw.length >= 3) { const r = (32 * IN) / dw[dw.length >> 1]; if (Math.abs(r / mpp - 1) > 0.08) return analyze(img, { ...opts, forceMpp: r, forceNote: `guessed from ${dw.length} door widths (32" typical) — please check one wall`, words, dimItems, tItems, askDim, keepGuess: true } as any); }
   }
   // ceiling heights written in the rooms ("10'-0" CLG") → wall height
-  let ceiling: number | null = null; { const hs: number[] = []; for (const ws2 of lineMap.values()) { const t = ws2.sort((a, b) => a.x0 - b.x0).map(w => w.text).join(' '); const m = /(\d{1,2}\s*'?\s*-?\s*\d{0,2}\s*"?)\s*(CLG|CEIL)/i.exec(t); const v = m ? parseDim(m[1].replace(/\s/g, '')) ?? parseDim(m[1].replace(/\s/g, '').replace(/^(\d+)-/, "$1'-")) : null; if (v && v > 7 * FT && v < 16 * FT) hs.push(v); }
+  let ceiling: number | null = null; { const hs: number[] = []; for (const ws2 of lineMap.values()) { const t = ws2.sort((a, b) => a.x0 - b.x0).map(w => w.text).join(' ').replace(/[°*″”]/g, '"').replace(/[′’~]/g, "'").replace(/(\d)[oO]/g, '$10').replace(/C[Il1]G/gi, 'CLG'); const m = /(\d{1,2}\s*'?\s*-?\s*\d{0,2}\s*"?)\s*(CLG|CEIL)/i.exec(t); const v = m ? parseDim(m[1].replace(/\s/g, '')) ?? parseDim(m[1].replace(/\s/g, '').replace(/^(\d+)-/, "$1'-")) : null; if (v && v > 7 * FT && v < 16 * FT) hs.push(v); }
     if (hs.length >= 2) { const cnt = new Map<number, number>(); hs.forEach(v => cnt.set(Math.round(v / IN), (cnt.get(Math.round(v / IN)) || 0) + 1)); ceiling = [...cnt].sort((a, b) => b[1] - a[1])[0][0] * IN; } }
   const allTxt = words.map(w => w.text).join(' ').toUpperCase(); const elevations = (allTxt.match(/ELEVATION/g) || []).length;
   { const m = /TOP\s*OF\s*(WALL|PLATE)[^0-9]{0,24}(\d{1,2}\s*'?\s*-?\s*\d{1,2}\s*"?)/.exec(allTxt); const v = m ? parseDim(m[2].replace(/\s/g, '')) : null; if (v && v > 7 * FT && v < 16 * FT) ceiling = v; }
@@ -436,7 +610,7 @@ export async function analyze(img: CanvasImageSource & { width: number; height: 
   const walls = dWalls.map(w => ({ a: scale(w.a), b: scale(w.b), t: w.t / k, ext: w.ext }));
   const longestDim = dims.reduce<DDim | null>((b, d) => (!b || d.m > b.m ? d : b), null);
   const sc = (d: DDim) => ({ ...d, x0: d.x0 / k, y0: d.y0 / k, x1: d.x1 / k, y1: d.y1 / k });
-  return { w: W / k, h: H / k, walls, openings: dOps, rooms: dRooms, mpp: mpp * k, ceiling, elevations, scaleFrom, scaleNote, dims: dims.map(sc), longestDim: longestDim ? sc(longestDim) : null, ocrOk, words: words.map(w => ({ ...w, x0: w.x0 / k, y0: w.y0 / k, x1: w.x1 / k, y1: w.y1 / k })), ms: performance.now() - t0 };
+  return { w: W / k, h: H / k, walls, openings: dOps, rooms: dRooms, mpp: mpp * k, ceiling, elevations, scaleFrom, scaleNote, dims: dims.map(sc), longestDim: longestDim ? sc(longestDim) : null, ocrOk, askDim, cands: cands.slice(0, 12), words: words.map(w => ({ ...w, x0: w.x0 / k, y0: w.y0 / k, x1: w.x1 / k, y1: w.y1 / k })), ms: performance.now() - t0 };
 }
 const ROOMWORD = /\b(bed|bdrm|br|bath|ba|wc|toilet|kitchen|kit|living|liv|dining|din|family|great|garage|gar|master|mstr|closet|clo|wic|laundry|util|utility|pantry|porch|lanai|patio|deck|den|office|study|foyer|entry|lobby|hall|nook|bonus|media|game|loft|mud|storage|stor|mech|lr|dr|k|pool|cabana|guest|suite|room)\b/i;
 /** "12'0" X 14'0"", "12'-6" x 10'", "12 x 14" (feet) → [m, m] */

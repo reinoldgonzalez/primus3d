@@ -326,8 +326,9 @@ export class PlanView {
     this.addWall(a, b); this.wallStart = b; this.hooks.onDraftChange(); this.redraw();
   }
   finishWall() { this.wallStart = null; this.chainCount = 0; this.hooks.onDraftChange(); this.redraw(); }
+  roomPreset: { name: string; floor: string; outdoor: boolean } | null = null;
   finishRoom() {
-    if (this.roomPts.length >= 3) { const pts = this.roomPts; const n = store.p.rooms.length + 1; const r = { id: uid(), name: `Room ${n}`, pts, floor: 'tile', ceilingHeight: store.p.defaults.ceiling, showCeiling: true };
+    if (this.roomPts.length >= 3) { const pts = this.roomPts; const n = store.p.rooms.length + 1; const pr = this.roomPreset; const same = pr ? store.p.rooms.filter(x => x.name.startsWith(pr.name)).length : 0; const r = { id: uid(), name: pr ? pr.name + (same ? ' ' + (same + 1) : '') : `Room ${n}`, pts, floor: pr ? pr.floor : 'tile', ceilingHeight: store.p.defaults.ceiling, showCeiling: !pr, outdoor: pr ? true : undefined };
       store.mutate(p => p.rooms.push(r)); store.select({ kind: 'room', id: r.id }); }
     this.roomPts = []; this.hooks.onDraftChange(); this.redraw();
   }
